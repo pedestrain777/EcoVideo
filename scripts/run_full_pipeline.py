@@ -124,6 +124,34 @@ def main() -> None:
         help="If set, save timing/speedup metrics to this json path. Default: <output>.metrics.json",
     )
 
+    # -------- NEW: cloud-only mode (WAN -> keyframes.mp4, then exit) --------
+    p.add_argument(
+        "--stop_after_wan",
+        action="store_true",
+        help="If set: only run WAN generation and save keyframes video, then exit (no EDEN interpolation).",
+    )
+    p.add_argument(
+        "--save_keyframes_video",
+        type=str,
+        default=None,
+        help="Cloud output: keyframes video path (mp4). Required if --stop_after_wan is set.",
+    )
+
+    # -------- NEW: append metrics (JSONL/CSV) --------
+    p.add_argument("--sample_id", type=str, default=None, help="Optional sample id for joining cloud/edge metrics.")
+    p.add_argument(
+        "--cloud_metrics_jsonl",
+        type=str,
+        default=None,
+        help="Append cloud metrics as JSONL (one line per sample).",
+    )
+    p.add_argument(
+        "--cloud_metrics_csv",
+        type=str,
+        default=None,
+        help="Append cloud metrics as CSV (one row per sample).",
+    )
+
     # 可选：保存 WAN 中间视频
     p.add_argument("--save_wan_video", type=str, default=None, help="save WAN raw/downsampled video for debugging")
     p.add_argument(
@@ -132,18 +160,14 @@ def main() -> None:
         default=None,
         help="save sampled video (after uniform/random sampling stage)",
     )
-    p.add_argument(
-        "--save_keyframes_video",
-        type=str,
-        default=None,
-        help="save keyframes-only preview video (after keyframe selection in VDiT)",
-    )
 
     args = p.parse_args()
 
     # 参数验证
     if args.input_video is None and (args.wan_ckpt_dir is None or args.prompt is None):
         p.error("Must provide either --input_video or (--wan_ckpt_dir + --prompt)")
+    if args.stop_after_wan and not args.save_keyframes_video:
+        p.error("--stop_after_wan requires --save_keyframes_video")
 
     os.makedirs(os.path.dirname(args.output_path) or ".", exist_ok=True)
     os.makedirs(os.path.dirname(args.log_file) or ".", exist_ok=True)
@@ -151,12 +175,16 @@ def main() -> None:
         os.makedirs(os.path.dirname(args.save_wan_video) or ".", exist_ok=True)
     if args.save_sampled_video:
         os.makedirs(os.path.dirname(args.save_sampled_video) or ".", exist_ok=True)
-    if args.save_keyframes_video:
-        os.makedirs(os.path.dirname(args.save_keyframes_video) or ".", exist_ok=True)
     if args.save_wan_full_baseline_video:
         os.makedirs(os.path.dirname(args.save_wan_full_baseline_video) or ".", exist_ok=True)
     if args.metrics_json:
         os.makedirs(os.path.dirname(args.metrics_json) or ".", exist_ok=True)
+    if args.save_keyframes_video:
+        os.makedirs(os.path.dirname(args.save_keyframes_video) or ".", exist_ok=True)
+    if args.cloud_metrics_jsonl:
+        os.makedirs(os.path.dirname(args.cloud_metrics_jsonl) or ".", exist_ok=True)
+    if args.cloud_metrics_csv:
+        os.makedirs(os.path.dirname(args.cloud_metrics_csv) or ".", exist_ok=True)
     if args.wan_entropy_debug_dir:
         os.makedirs(args.wan_entropy_debug_dir, exist_ok=True)
 
@@ -245,7 +273,16 @@ def main() -> None:
         topk_ratio=args.topk_ratio,
     )
 
-    full_cfg = FullPipelineConfig(wan=wan_cfg, iframe=iframe_cfg, generator_name=args.generator)
+    full_cfg = FullPipelineConfig(
+        wan=wan_cfg,
+        iframe=iframe_cfg,
+        generator_name=args.generator,
+        stop_after_wan=args.stop_after_wan,
+        save_keyframes_video_path=args.save_keyframes_video,
+        sample_id=args.sample_id,
+        cloud_metrics_jsonl_path=args.cloud_metrics_jsonl,
+        cloud_metrics_csv_path=args.cloud_metrics_csv,
+    )
 
     run_full_pipeline(
         prompt=args.prompt,
@@ -256,7 +293,7 @@ def main() -> None:
         cfg=full_cfg,
         log_file=args.log_file,
         save_sampled_video_path=args.save_sampled_video,
-        save_keyframes_video_path=args.save_keyframes_video,
+        save_keyframes_video_path=args.save_keyframes_video,  # 仍保留：用于"单机插帧流程"时保存 preview
         save_wan_video_path=args.save_wan_video,
         generate_wan_full_baseline=args.wan_generate_full_baseline,
         save_wan_full_baseline_video_path=args.save_wan_full_baseline_video,

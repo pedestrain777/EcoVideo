@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import csv
 from dataclasses import dataclass, replace
+from datetime import datetime
+from pathlib import Path
 from typing import Optional, Dict, Any
 import os
 import json
@@ -38,11 +41,40 @@ def _read_json_if_exists(path: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _append_jsonl(path: Optional[str], obj: Dict[str, Any]) -> None:
+    if not path:
+        return
+    _ensure_parent_dir(path)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+
+def _append_csv(path: Optional[str], row: Dict[str, Any], fieldnames: list) -> None:
+    if not path:
+        return
+    _ensure_parent_dir(path)
+    file_exists = os.path.isfile(path)
+    with open(path, "a", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        if not file_exists:
+            w.writeheader()
+        w.writerow({k: row.get(k, None) for k in fieldnames})
+
+
 @dataclass(frozen=True)
 class FullPipelineConfig:
     wan: WanGenerateConfig
     iframe: PipelineConfig
     generator_name: str = "wan"
+
+    # cloud-only mode
+    stop_after_wan: bool = False
+    save_keyframes_video_path: Optional[str] = None
+
+    # metrics append
+    sample_id: Optional[str] = None
+    cloud_metrics_jsonl_path: Optional[str] = None
+    cloud_metrics_csv_path: Optional[str] = None
 
 
 @torch.no_grad()
@@ -165,6 +197,100 @@ def run_full_pipeline(
     frames, fps_src = generator.generate(prompt)
     metrics["timing"]["wan_main_wall_sec"] = float(time.perf_counter() - t0)
     metrics["io"] = {"fps_src": float(fps_src), "num_frames": int(frames.shape[0])}
+
+    # -------- NEW: save keyframes video (cloud artifact) --------
+    # For cloud-only mode, the WAN output is treated as "keyframes video" delivered to edge.
+    keyframes_path = cfg.save_keyframes_video_path
+    if keyframes_path:
+        _ensure_parent_dir(keyframes_path)
+        write_video_tensor(keyframes_path, frames, fps=float(fps_src))
+        try:
+            metrics.setdefault("io", {})
+            metrics["io"]["keyframes_video_path"] = keyframes_path
+            metrics["io"]["keyframes_file_bytes"] = int(os.path.getsize(keyframes_path))
+        except Exception:
+            pass
+
+    # -------- NEW: stop after WAN (cloud-only) --------
+    if cfg.stop_after_wan:
+        # define sample_id
+        if cfg.sample_id:
+            sid = cfg.sample_id
+        elif keyframes_path:
+            sid = Path(keyframes_path).stem
+        else:
+            sid = f"sample_{int(time.time())}"
+
+        cloud_record: Dict[str, Any] = {
+            "ts": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "role": "cloud",
+            "sample_id": sid,
+            "prompt": prompt,
+            "wan_ckpt_dir": wan_ckpt_dir,
+            "generator_name": cfg.generator_name,
+            "cfg": {
+                "wan_task": cfg.wan.task,
+                "wan_size": cfg.wan.size,
+                "wan_frame_num": cfg.wan.frame_num,
+                "wan_seed": cfg.wan.seed,
+                "keyframe_by_entropy": cfg.wan.keyframe_by_entropy,
+                "keyframe_topk": cfg.wan.keyframe_topk,
+                "keyframe_out_fps": cfg.wan.keyframe_out_fps,
+                "keyframe_target_fps": cfg.wan.keyframe_target_fps,
+                "nonkey_update_mode": cfg.wan.nonkey_update_mode,
+                "teacache_rel_l1_thresh": cfg.wan.teacache_rel_l1_thresh,
+                "teacache_max_skip": cfg.wan.teacache_max_skip,
+                "teacache_warmup": cfg.wan.teacache_warmup,
+            },
+            "timing": {
+                "cloud_latency_sec": float(metrics["timing"]["wan_main_wall_sec"]),
+                "wan_main_wall_sec": float(metrics["timing"]["wan_main_wall_sec"]),
+            },
+            "io": {
+                "fps_keyframes": float(fps_src),
+                "num_frames_keyframes": int(frames.shape[0]),
+                "keyframes_video_path": keyframes_path,
+                "keyframes_file_bytes": int(metrics.get("io", {}).get("keyframes_file_bytes", 0)),
+            },
+        }
+
+        _append_jsonl(cfg.cloud_metrics_jsonl_path, cloud_record)
+
+        csv_fields = [
+            "ts", "role", "sample_id",
+            "cloud_latency_sec",
+            "fps_keyframes", "num_frames_keyframes", "keyframes_file_bytes",
+            "wan_task", "wan_size", "wan_frame_num", "wan_seed",
+            "keyframe_by_entropy", "keyframe_topk", "keyframe_out_fps", "keyframe_target_fps",
+            "nonkey_update_mode",
+            "prompt",
+            "keyframes_video_path",
+        ]
+        csv_row = {
+            "ts": cloud_record["ts"],
+            "role": "cloud",
+            "sample_id": sid,
+            "cloud_latency_sec": cloud_record["timing"]["cloud_latency_sec"],
+            "fps_keyframes": cloud_record["io"]["fps_keyframes"],
+            "num_frames_keyframes": cloud_record["io"]["num_frames_keyframes"],
+            "keyframes_file_bytes": cloud_record["io"]["keyframes_file_bytes"],
+            "wan_task": cloud_record["cfg"]["wan_task"],
+            "wan_size": cloud_record["cfg"]["wan_size"],
+            "wan_frame_num": cloud_record["cfg"]["wan_frame_num"],
+            "wan_seed": cloud_record["cfg"]["wan_seed"],
+            "keyframe_by_entropy": cloud_record["cfg"]["keyframe_by_entropy"],
+            "keyframe_topk": cloud_record["cfg"]["keyframe_topk"],
+            "keyframe_out_fps": cloud_record["cfg"]["keyframe_out_fps"],
+            "keyframe_target_fps": cloud_record["cfg"]["keyframe_target_fps"],
+            "nonkey_update_mode": cloud_record["cfg"]["nonkey_update_mode"],
+            "prompt": cloud_record["prompt"],
+            "keyframes_video_path": keyframes_path,
+        }
+        _append_csv(cfg.cloud_metrics_csv_path, csv_row, csv_fields)
+
+        metrics["timing"]["pipeline_total_sec"] = float(time.perf_counter() - t_pipeline0)
+        _write_json(metrics_json_path, metrics)
+        return metrics
 
     if cfg.wan.debug_dir:
         wan_internal_timing = _read_json_if_exists(os.path.join(str(cfg.wan.debug_dir), "timing.json"))

@@ -12,8 +12,12 @@ python scripts/run_pipeline.py \
 from __future__ import annotations
 
 import argparse
+import csv
+import json
 import os
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
 
 # 允许直接 `python scripts/run_pipeline.py ...` 时 import vdit.*
@@ -54,10 +58,19 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--topk_ratio", type=float, default=0.1)
 
+    # -------- NEW: append metrics (JSONL/CSV) --------
+    p.add_argument("--sample_id", type=str, default=None, help="Optional sample id for joining cloud/edge metrics.")
+    p.add_argument("--metrics_jsonl", type=str, default=None, help="Append edge metrics as JSONL.")
+    p.add_argument("--metrics_csv", type=str, default=None, help="Append edge metrics as CSV.")
+
     args = p.parse_args()
 
     os.makedirs(os.path.dirname(args.output_path) or ".", exist_ok=True)
     os.makedirs(os.path.dirname(args.log_file) or ".", exist_ok=True)
+    if args.metrics_jsonl:
+        os.makedirs(os.path.dirname(args.metrics_jsonl) or ".", exist_ok=True)
+    if args.metrics_csv:
+        os.makedirs(os.path.dirname(args.metrics_csv) or ".", exist_ok=True)
 
     # 延迟导入：避免 `--help` 也触发重依赖（如 lpips/xformers）导入失败
     from vdit.pipeline.run_iframe import PipelineConfig, run_interpolation_pipeline
@@ -75,12 +88,72 @@ def main() -> None:
         topk_ratio=args.topk_ratio,
     )
 
+    t0 = time.perf_counter()
     run_interpolation_pipeline(
         video_path=args.video_path,
         output_path=args.output_path,
         cfg=cfg,
         log_file=args.log_file,
     )
+    edge_latency = float(time.perf_counter() - t0)
+
+    # sample_id default: stem of input keyframes video
+    if args.sample_id:
+        sid = args.sample_id
+    else:
+        sid = Path(args.video_path).stem
+
+    record = {
+        "ts": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "role": "edge",
+        "sample_id": sid,
+        "timing": {"edge_latency_sec": edge_latency},
+        "io": {"input_keyframes_video": args.video_path, "output_video": args.output_path},
+        "cfg": {
+            "eden_config": args.eden_config,
+            "target_fps": float(args.target_fps),
+            "keyframe_mode": args.keyframe_mode,
+            "use_split_gpu": bool(args.use_split_gpu),
+            "raft_ckpt": args.raft_ckpt,
+            "topk_ratio": float(args.topk_ratio),
+        },
+    }
+
+    # append JSONL
+    if args.metrics_jsonl:
+        with open(args.metrics_jsonl, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    # append CSV
+    if args.metrics_csv:
+        csv_fields = [
+            "ts", "role", "sample_id",
+            "edge_latency_sec",
+            "target_fps", "keyframe_mode", "use_split_gpu", "topk_ratio",
+            "raft_ckpt",
+            "input_keyframes_video", "output_video",
+            "eden_config",
+        ]
+        row = {
+            "ts": record["ts"],
+            "role": "edge",
+            "sample_id": sid,
+            "edge_latency_sec": edge_latency,
+            "target_fps": record["cfg"]["target_fps"],
+            "keyframe_mode": record["cfg"]["keyframe_mode"],
+            "use_split_gpu": record["cfg"]["use_split_gpu"],
+            "topk_ratio": record["cfg"]["topk_ratio"],
+            "raft_ckpt": record["cfg"]["raft_ckpt"],
+            "input_keyframes_video": args.video_path,
+            "output_video": args.output_path,
+            "eden_config": args.eden_config,
+        }
+        file_exists = os.path.isfile(args.metrics_csv)
+        with open(args.metrics_csv, "a", encoding="utf-8", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=csv_fields)
+            if not file_exists:
+                w.writeheader()
+            w.writerow(row)
 
 
 if __name__ == "__main__":
