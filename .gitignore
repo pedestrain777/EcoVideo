@@ -8,8 +8,8 @@
 *.onnx
 *.safetensors
 
-# --------------- 存放模型的目录 ---------------
-models/
+# --------------- 存放模型的目录（仅根目录，避免误忽略源码包 src/vdit/models/） ---------------
+/models/
 checkpoints/
 weights/
 flolpips/weights/
