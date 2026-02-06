@@ -45,8 +45,8 @@ def main() -> None:
     p.add_argument(
         "--raft_ckpt",
         type=str,
-        default="/data/models/raft/raft-things.pth",
-        help="restore checkpoint (default: /data/models/raft/raft-things.pth)",
+        default="/data/chenjiayu/hengyi_zhang/pretrained_models/raft/raft-things.pth",
+        help="restore checkpoint (default: /data/chenjiayu/hengyi_zhang/pretrained_models/raft/raft-things.pth)",
     )
     p.add_argument("--raft_device", type=str, default="cuda:0")
     p.add_argument("--eden_device", type=str, default="cuda:0")

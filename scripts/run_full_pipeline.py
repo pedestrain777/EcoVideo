@@ -23,9 +23,32 @@ for _parent in [_HERE] + list(_HERE.parents):
 def main() -> None:
     p = argparse.ArgumentParser()
 
-    # -------- WAN 输入 --------
-    p.add_argument("--wan_ckpt_dir", type=str, default=None, help="WAN checkpoint directory (required if not using --input_video)")
-    p.add_argument("--prompt", type=str, default=None, help="Text prompt for WAN (required if not using --input_video)")
+    # -------- Unified generator inputs (Scheme B) --------
+    p.add_argument(
+        "--generator",
+        type=str,
+        default="wan",
+        choices=["wan", "ltx"],
+        help="generator backend name",
+    )
+    p.add_argument(
+        "--ckpt",
+        type=str,
+        default=None,
+        help="WAN: checkpoint directory; LTX: .safetensors checkpoint file",
+    )
+    p.add_argument(
+        "--text_encoder_path",
+        type=str,
+        default=None,
+        help="Only for LTX: HF repo/local dir containing text_encoder+tokenizer",
+    )
+    p.add_argument(
+        "--prompt",
+        type=str,
+        default=None,
+        help="Text prompt (required if not using --input_video)",
+    )
     
     # 可选：直接从已有视频开始（跳过 WAN 生成，节省时间）
     p.add_argument("--input_video", type=str, default=None, help="Input video path (skip WAN generation if provided)")
@@ -51,7 +74,6 @@ def main() -> None:
         choices=["uniform", "random", "stratified_random"],
     )
     p.add_argument("--wan_frame_sample_seed", type=int, default=0)
-    p.add_argument("--generator", type=str, default="wan", help="generator backend name (default: wan)")
 
     # -------- WAN: entropy keyframe（真正裁剪 latent 时间维）--------
     p.add_argument("--wan_keyframe_by_entropy", action="store_true")
@@ -84,6 +106,53 @@ def main() -> None:
     p.add_argument("--wan_save_teacache_trace_png", action="store_true")
     p.add_argument("--wan_no_save_teacache_trace_png", action="store_true")
 
+    # -------- LTX generator 参数（与 LtxGenerateConfig 对齐）--------
+    p.add_argument("--ltx_precision", type=str, default="bfloat16")
+    p.add_argument("--ltx_sampler", type=str, default=None)
+    p.add_argument("--ltx_device", type=str, default="cuda")
+    p.add_argument("--ltx_seed", type=int, default=0)
+    p.add_argument("--ltx_height", type=int, default=512)
+    p.add_argument("--ltx_width", type=int, default=768)
+    p.add_argument("--ltx_num_frames", type=int, default=81)
+    p.add_argument("--ltx_frame_rate", type=float, default=24.0)
+    p.add_argument("--ltx_steps", type=int, default=50)
+    p.add_argument("--ltx_guidance_scale", type=float, default=5.0)
+    p.add_argument("--ltx_stg_scale", type=float, default=0.0)
+    p.add_argument("--ltx_rescaling_scale", type=float, default=0.7)
+    p.add_argument("--ltx_cfg_star_rescale", action="store_true")
+    p.add_argument("--ltx_mixed_precision", action="store_true")
+    p.add_argument("--ltx_offload_to_cpu", action="store_true")
+    p.add_argument("--ltx_stochastic_sampling", action="store_true")
+
+    # LTX: WAN-style prune + nonkey update
+    p.add_argument("--ltx_keyframe_by_entropy", action="store_true")
+    p.add_argument("--ltx_entropy_steps", type=int, default=5)
+    p.add_argument(
+        "--ltx_entropy_mode",
+        type=str,
+        default="ema",
+        choices=["last", "mean", "ema"],
+    )
+    p.add_argument("--ltx_entropy_ema_alpha", type=float, default=0.6)
+    p.add_argument("--ltx_entropy_block_idx", type=int, default=-1)
+    p.add_argument("--ltx_keyframe_topk", type=int, default=16)
+    p.add_argument("--ltx_keyframe_cover", action="store_true")
+    p.add_argument("--ltx_no_keyframe_cover", action="store_true")
+    p.add_argument("--ltx_use_nonkey_context", action="store_true")
+    p.add_argument("--ltx_no_nonkey_context", action="store_true")
+    p.add_argument("--ltx_keyframe_out_fps", type=float, default=None)
+
+    p.add_argument(
+        "--ltx_nonkey_update_mode",
+        type=str,
+        default="none",
+        choices=["none", "interval", "teacache"],
+    )
+    p.add_argument("--ltx_nonkey_update_interval", type=int, default=5)
+    p.add_argument("--ltx_teacache_rel_l1_thresh", type=float, default=0.02)
+    p.add_argument("--ltx_teacache_max_skip", type=int, default=8)
+    p.add_argument("--ltx_teacache_warmup", type=int, default=2)
+
     # -------- 插帧参数（你原来的 pipeline 参数）--------
     p.add_argument("--eden_config", type=str, required=True)
     p.add_argument("--output_path", type=str, default="interpolation_outputs/final.mp4")
@@ -91,8 +160,8 @@ def main() -> None:
     p.add_argument(
         "--raft_ckpt",
         type=str,
-        default="/data/models/raft/raft-things.pth",
-        help="restore checkpoint (default: /data/models/raft/raft-things.pth)",
+        default="/data/chenjiayu/hengyi_zhang/pretrained_models/raft/raft-things.pth",
+        help="restore checkpoint (default: /data/chenjiayu/hengyi_zhang/pretrained_models/raft/raft-things.pth)",
     )
     p.add_argument("--raft_device", type=str, default="cuda:0")
     p.add_argument("--eden_device", type=str, default="cuda:0")
@@ -164,10 +233,15 @@ def main() -> None:
     args = p.parse_args()
 
     # 参数验证
-    if args.input_video is None and (args.wan_ckpt_dir is None or args.prompt is None):
-        p.error("Must provide either --input_video or (--wan_ckpt_dir + --prompt)")
+    if args.input_video is None:
+        if args.prompt is None or args.ckpt is None:
+            p.error("Must provide either --input_video or (--prompt + --ckpt)")
+        if args.generator == "ltx" and args.text_encoder_path is None:
+            p.error("--generator ltx requires --text_encoder_path")
     if args.stop_after_wan and not args.save_keyframes_video:
         p.error("--stop_after_wan requires --save_keyframes_video")
+    if args.wan_generate_full_baseline and args.generator != "wan":
+        p.error("--wan_generate_full_baseline only supports --generator wan")
 
     os.makedirs(os.path.dirname(args.output_path) or ".", exist_ok=True)
     os.makedirs(os.path.dirname(args.log_file) or ".", exist_ok=True)
@@ -190,6 +264,7 @@ def main() -> None:
 
     # 延迟导入（与 run_pipeline.py 一致）
     from vdit.generators.wan_t2v import WanGenerateConfig
+    from vdit.generators.ltx_t2v import LtxGenerateConfig
     from vdit.pipeline.full_pipeline import FullPipelineConfig, run_full_pipeline
     from vdit.pipeline.run_iframe import PipelineConfig
 
@@ -273,8 +348,55 @@ def main() -> None:
         topk_ratio=args.topk_ratio,
     )
 
+    # LTX generator config (only used when args.generator == "ltx")
+    ltx_keyframe_cover = True
+    if args.ltx_no_keyframe_cover:
+        ltx_keyframe_cover = False
+    elif args.ltx_keyframe_cover:
+        ltx_keyframe_cover = True
+
+    ltx_use_nonkey_context = True
+    if args.ltx_no_nonkey_context:
+        ltx_use_nonkey_context = False
+    elif args.ltx_use_nonkey_context:
+        ltx_use_nonkey_context = True
+
+    ltx_cfg = LtxGenerateConfig(
+        precision=args.ltx_precision,
+        sampler=args.ltx_sampler,
+        device=args.ltx_device,
+        seed=args.ltx_seed,
+        height=args.ltx_height,
+        width=args.ltx_width,
+        num_frames=args.ltx_num_frames,
+        frame_rate=args.ltx_frame_rate,
+        num_inference_steps=args.ltx_steps,
+        guidance_scale=args.ltx_guidance_scale,
+        stg_scale=args.ltx_stg_scale,
+        rescaling_scale=args.ltx_rescaling_scale,
+        cfg_star_rescale=bool(args.ltx_cfg_star_rescale),
+        mixed_precision=bool(args.ltx_mixed_precision),
+        offload_to_cpu=bool(args.ltx_offload_to_cpu),
+        stochastic_sampling=bool(args.ltx_stochastic_sampling),
+        keyframe_by_entropy=bool(args.ltx_keyframe_by_entropy),
+        entropy_steps=args.ltx_entropy_steps,
+        entropy_mode=args.ltx_entropy_mode,
+        entropy_ema_alpha=args.ltx_entropy_ema_alpha,
+        entropy_block_idx=args.ltx_entropy_block_idx,
+        keyframe_topk=args.ltx_keyframe_topk,
+        keyframe_cover=ltx_keyframe_cover,
+        use_nonkey_context=ltx_use_nonkey_context,
+        keyframe_out_fps=args.ltx_keyframe_out_fps,
+        nonkey_update_mode=args.ltx_nonkey_update_mode,
+        nonkey_update_interval=args.ltx_nonkey_update_interval,
+        teacache_rel_l1_thresh=args.ltx_teacache_rel_l1_thresh,
+        teacache_max_skip=args.ltx_teacache_max_skip,
+        teacache_warmup=args.ltx_teacache_warmup,
+    )
+
     full_cfg = FullPipelineConfig(
         wan=wan_cfg,
+        ltx=(ltx_cfg if args.generator == "ltx" else None),
         iframe=iframe_cfg,
         generator_name=args.generator,
         stop_after_wan=args.stop_after_wan,
@@ -286,7 +408,8 @@ def main() -> None:
 
     run_full_pipeline(
         prompt=args.prompt,
-        wan_ckpt_dir=args.wan_ckpt_dir,
+        ckpt=args.ckpt,
+        text_encoder_path=args.text_encoder_path,
         input_video=args.input_video,
         input_fps=args.input_fps,
         output_path=args.output_path,

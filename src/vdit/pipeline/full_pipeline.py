@@ -15,6 +15,7 @@ import torch
 
 from vdit.generators.base import create_generator
 from vdit.generators.wan_t2v import WanGenerateConfig
+from vdit.generators.ltx_t2v import LtxGenerateConfig
 from vdit.pipeline.run_iframe import PipelineConfig, run_interpolation_pipeline_from_frames
 from vdit.pipeline.video_io import read_video_tensor, write_video_tensor
 
@@ -64,6 +65,7 @@ def _append_csv(path: Optional[str], row: Dict[str, Any], fieldnames: list) -> N
 @dataclass(frozen=True)
 class FullPipelineConfig:
     wan: WanGenerateConfig
+    ltx: LtxGenerateConfig | None
     iframe: PipelineConfig
     generator_name: str = "wan"
 
@@ -81,7 +83,8 @@ class FullPipelineConfig:
 def run_full_pipeline(
     *,
     prompt: Optional[str] = None,
-    wan_ckpt_dir: Optional[str] = None,
+    ckpt: Optional[str] = None,
+    text_encoder_path: Optional[str] = None,
     input_video: Optional[str] = None,
     input_fps: Optional[float] = None,
     output_path: str,
@@ -102,10 +105,12 @@ def run_full_pipeline(
     metrics: Dict[str, Any] = {
         "output_path": output_path,
         "input_video": input_video,
-        "wan_ckpt_dir": wan_ckpt_dir,
+        "ckpt": ckpt,
+        "text_encoder_path": text_encoder_path,
         "prompt": prompt,
         "generator_name": cfg.generator_name,
         "wan_cfg": cfg.wan.__dict__,
+        "ltx_cfg": (cfg.ltx.__dict__ if cfg.ltx is not None else None),
         "iframe_cfg": {
             "eden_config": cfg.iframe.eden_config,
             "raft_ckpt": cfg.iframe.raft_ckpt,
@@ -155,8 +160,10 @@ def run_full_pipeline(
     # -------- baseline WAN full generation（可选）--------
     baseline_wan_timing = None
     if generate_wan_full_baseline:
-        if prompt is None or wan_ckpt_dir is None:
-            raise ValueError("generate_wan_full_baseline=True requires prompt + wan_ckpt_dir")
+        if cfg.generator_name != "wan":
+            raise ValueError("generate_wan_full_baseline=True only supports generator_name='wan'")
+        if prompt is None or ckpt is None:
+            raise ValueError("generate_wan_full_baseline=True requires prompt + ckpt (WAN checkpoint dir)")
 
         baseline_debug_dir = None
         if cfg.wan.debug_dir:
@@ -170,7 +177,7 @@ def run_full_pipeline(
         )
 
         t0 = time.perf_counter()
-        gen_base = create_generator(cfg.generator_name, ckpt_dir=wan_ckpt_dir, cfg=wan_baseline_cfg)
+        gen_base = create_generator("wan", ckpt_dir=ckpt, cfg=wan_baseline_cfg)
         baseline_frames, baseline_fps = gen_base.generate(prompt)
         metrics["timing"]["wan_full_baseline_wall_sec"] = float(time.perf_counter() - t0)
         metrics["baseline"] = {
@@ -188,14 +195,32 @@ def run_full_pipeline(
             _ensure_parent_dir(save_wan_full_baseline_video_path)
             write_video_tensor(save_wan_full_baseline_video_path, baseline_frames, fps=float(baseline_fps))
 
-    # -------- main WAN generation（你的关键帧/Method2/完整等）--------
-    if prompt is None or wan_ckpt_dir is None:
-        raise ValueError("Must provide either (input_video) or (prompt + wan_ckpt_dir)")
+    # -------- main generation（WAN or LTX）--------
+    if prompt is None or ckpt is None:
+        raise ValueError("Must provide either (input_video) or (prompt + ckpt)")
 
     t0 = time.perf_counter()
-    generator = create_generator(cfg.generator_name, ckpt_dir=wan_ckpt_dir, cfg=cfg.wan)
-    frames, fps_src = generator.generate(prompt)
-    metrics["timing"]["wan_main_wall_sec"] = float(time.perf_counter() - t0)
+    if cfg.generator_name == "wan":
+        generator = create_generator("wan", ckpt_dir=ckpt, cfg=cfg.wan)
+        frames, fps_src = generator.generate(prompt)
+        metrics["timing"]["gen_main_wall_sec"] = float(time.perf_counter() - t0)
+        metrics["timing"]["wan_main_wall_sec"] = metrics["timing"]["gen_main_wall_sec"]
+    elif cfg.generator_name == "ltx":
+        if cfg.ltx is None:
+            raise ValueError("generator_name='ltx' requires cfg.ltx to be set")
+        if text_encoder_path is None:
+            raise ValueError("generator_name='ltx' requires text_encoder_path")
+        generator = create_generator(
+            "ltx",
+            ckpt_path=ckpt,
+            text_encoder_path=text_encoder_path,
+            cfg=cfg.ltx,
+        )
+        frames, fps_src = generator.generate(prompt)
+        metrics["timing"]["gen_main_wall_sec"] = float(time.perf_counter() - t0)
+    else:
+        raise ValueError(f"Unsupported generator_name: {cfg.generator_name}")
+
     metrics["io"] = {"fps_src": float(fps_src), "num_frames": int(frames.shape[0])}
 
     # -------- NEW: save keyframes video (cloud artifact) --------
@@ -226,7 +251,8 @@ def run_full_pipeline(
             "role": "cloud",
             "sample_id": sid,
             "prompt": prompt,
-            "wan_ckpt_dir": wan_ckpt_dir,
+            "ckpt": ckpt,
+            "text_encoder_path": text_encoder_path,
             "generator_name": cfg.generator_name,
             "cfg": {
                 "wan_task": cfg.wan.task,

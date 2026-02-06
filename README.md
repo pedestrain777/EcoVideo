@@ -63,8 +63,8 @@ pip install -r requirements.txt
 
 你需要准备以下权重（建议不要提交到 git，`.gitignore` 已忽略）：
 
-* WAN 1.3B checkpoint（示例路径：`/data/models/wan1.3b_checkpoint`）
-* RAFT 权重（示例路径：`/data/models/raft/raft-things.pth`）
+* WAN checkpoint（示例路径：`/data/chenjiayu/hengyi_zhang/pretrained_models/Wan2.1-T2V-14B`，以你实际下载的为准）
+* RAFT 权重（示例路径：`/data/chenjiayu/hengyi_zhang/pretrained_models/raft/raft-things.pth`）
 * EDEN 权重（由 `--eden_config` 内部配置指定）
 
 ---
@@ -75,10 +75,10 @@ pip install -r requirements.txt
 
 ```bash
 python scripts/run_full_pipeline.py \
-  --wan_ckpt_dir /data/models/wan1.3b_checkpoint \
+  --wan_ckpt_dir /data/chenjiayu/hengyi_zhang/pretrained_models/Wan2.1-T2V-14B \
   --prompt "一只白猫和一只黑猫在打架" \
   --eden_config configs/eval_eden.yaml \
-  --raft_ckpt /data/models/raft/raft-things.pth \
+  --raft_ckpt /data/chenjiayu/hengyi_zhang/pretrained_models/raft/raft-things.pth \
   --wan_out_fps 8 \
   --wan_frame_sample uniform \
   --keyframe_mode all \
@@ -102,7 +102,7 @@ python scripts/run_full_pipeline.py \
 python scripts/run_full_pipeline.py \
   --input_video path/to/input.mp4 \
   --eden_config configs/eval_eden.yaml \
-  --raft_ckpt /data/models/raft/raft-things.pth \
+  --raft_ckpt /data/chenjiayu/hengyi_zhang/pretrained_models/raft/raft-things.pth \
   --keyframe_mode all \
   --target_fps 24 \
   --output_path interpolation_outputs/out_24fps.mp4
