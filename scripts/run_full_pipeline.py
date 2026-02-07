@@ -21,6 +21,7 @@ for _parent in [_HERE] + list(_HERE.parents):
 
 
 def main() -> None:
+    print("[run_full_pipeline] starting ...", flush=True)
     p = argparse.ArgumentParser()
 
     # -------- Unified generator inputs (Scheme B) --------
@@ -102,7 +103,7 @@ def main() -> None:
     p.add_argument("--wan_nonkey_update_interval", type=int, default=5)
     p.add_argument("--wan_teacache_rel_l1_thresh", type=float, default=0.02)
     p.add_argument("--wan_teacache_max_skip", type=int, default=10)
-    p.add_argument("--wan_teacache_warmup", type=int, default=0)
+    p.add_argument("--wan_teacache_warmup", type=int, default=2)
     p.add_argument("--wan_save_teacache_trace_png", action="store_true")
     p.add_argument("--wan_no_save_teacache_trace_png", action="store_true")
 
@@ -263,10 +264,12 @@ def main() -> None:
         os.makedirs(args.wan_entropy_debug_dir, exist_ok=True)
 
     # 延迟导入（与 run_pipeline.py 一致）
+    print("[run_full_pipeline] importing generators (may take 30s+) ...", flush=True)
     from vdit.generators.wan_t2v import WanGenerateConfig
     from vdit.generators.ltx_t2v import LtxGenerateConfig
     from vdit.pipeline.full_pipeline import FullPipelineConfig, run_full_pipeline
     from vdit.pipeline.run_iframe import PipelineConfig
+    print("[run_full_pipeline] imports done, building config ...", flush=True)
 
     # WAN 配置（仅在需要 WAN 生成时使用）
     keyframe_cover = True
@@ -406,6 +409,7 @@ def main() -> None:
         cloud_metrics_csv_path=args.cloud_metrics_csv,
     )
 
+    print("[run_full_pipeline] calling run_full_pipeline (loading models, may take 1–2 min) ...", flush=True)
     run_full_pipeline(
         prompt=args.prompt,
         ckpt=args.ckpt,

@@ -218,6 +218,7 @@ def run_full_pipeline(
         )
         frames, fps_src = generator.generate(prompt)
         metrics["timing"]["gen_main_wall_sec"] = float(time.perf_counter() - t0)
+        metrics["timing"]["wan_main_wall_sec"] = metrics["timing"]["gen_main_wall_sec"]  # LTX 也用此 key，stop_after_wan 会读
     else:
         raise ValueError(f"Unsupported generator_name: {cfg.generator_name}")
 

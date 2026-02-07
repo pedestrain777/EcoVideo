@@ -20,7 +20,8 @@
 ```
 VDiT/
   README.md
-  requirements.txt
+  requirements_no_occ.txt
+  requirements_ltx.txt          # LTX 生成器额外依赖（见 2.3）
   scripts/
     run_full_pipeline.py        # WAN->采样->插帧->输出（主入口）
     run_pipeline.py             # 从已有视频插帧（旧入口，仍可用）
@@ -28,13 +29,14 @@ VDiT/
     eval_eden.yaml              # EDEN/插帧评估相关配置（也可用于推理）
   src/
     vdit/
-      generators/               # 生成器插件（当前实现 wan）
+      generators/               # 生成器插件（wan / ltx）
       pipeline/                 # full_pipeline + run_iframe + video_io
       interpolators/            # EDEN 推理封装
       scheduler/                # greedy_refine 等
       modules/                  # attention（含 xformers fallback）
   third_party/
     wan/wan/                    # WAN 源码（保持 import wan）
+    ltx_video/ltx_video/        # LTX-Video 源码（--generator ltx）
     raft/                       # RAFT 相关代码
     vbench/                     # VBench（可选）
   docs/legacy/                  # 历史说明文档（不影响主流程）
@@ -52,10 +54,23 @@ VDiT/
 ### 2.2 安装依赖
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements_no_occ.txt
 ```
 
+（若仓库提供 `requirements.txt` 也可用其替代。）
+
 > 注意：本项目写视频使用 PyAV。若你的环境 PyAV 版本较新（例如 14.x），也能运行，因为我们已绕过 torchvision 写视频接口。
+
+### 2.3 使用 LTX 生成器（zhy_vdit 环境）
+
+若要在 **zhy_vdit** 等已有 VDiT 环境中运行 `--generator ltx`，需额外安装 LTX 依赖：
+
+```bash
+conda activate zhy_vdit
+pip install -r requirements_ltx.txt
+```
+
+LTX 官方要求 `torch>=2.1.0`。若当前为 torch 2.0.x 且运行 LTX 报错，可再执行：`pip install 'torch>=2.1.0' 'torchvision>=0.16.0'`，必要时升级 xformers。
 
 ---
 
@@ -64,6 +79,7 @@ pip install -r requirements.txt
 你需要准备以下权重（建议不要提交到 git，`.gitignore` 已忽略）：
 
 * WAN checkpoint（示例路径：`/data/chenjiayu/hengyi_zhang/pretrained_models/Wan2.1-T2V-14B`，以你实际下载的为准）
+* 若使用 LTX：LTX checkpoint（`.safetensors`）及 text encoder 路径（`--ckpt`、`--text_encoder_path`）
 * RAFT 权重（示例路径：`/data/chenjiayu/hengyi_zhang/pretrained_models/raft/raft-things.pth`）
 * EDEN 权重（由 `--eden_config` 内部配置指定）
 
@@ -93,6 +109,23 @@ python scripts/run_full_pipeline.py \
 * `--wan_frame_sample uniform`：均匀采样（也支持 random/stratified_random）
 * `--keyframe_mode all`：**重要**：因为关键帧已经在 WAN 阶段产生，所以插帧阶段不再二次采样
 * `--target_fps 24`：最终输出帧率
+
+### 4.1 使用 LTX 生成器（需先按 2.3 安装 requirements_ltx.txt）
+
+```bash
+python scripts/run_full_pipeline.py \
+  --generator ltx \
+  --ckpt /path/to/ltx_model.safetensors \
+  --text_encoder_path /path/to/ltx_text_encoder \
+  --prompt "a cat running in the street" \
+  --eden_config configs/eval_eden.yaml \
+  --raft_ckpt /path/to/raft/raft-things.pth \
+  --keyframe_mode all \
+  --target_fps 24 \
+  --output_path interpolation_outputs/ltx_final.mp4
+```
+
+LTX 专用参数见 `--ltx_*`（如 `--ltx_steps`、`--ltx_guidance_scale`、`--ltx_keyframe_by_entropy` 等）。
 
 ---
 

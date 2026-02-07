@@ -88,18 +88,17 @@ def run_interpolation_pipeline_from_frames(
     timing["keyframe_select_sec"] = float(time.perf_counter() - t0)
     timing["keyframe_count"] = int(len(init_frames))
 
+    # 若关键帧数已不少于按 duration*target_fps 算出的 target_len，则至少输出与关键帧数一致，避免报错
+    if len(init_frames) > target_len:
+        target_len = len(init_frames)
+        timing["target_len"] = int(target_len)
+
     t0 = time.perf_counter()
     if save_keyframes_video_path is not None:
         keyframes_tensor = torch.cat(init_frames, dim=0)
         os.makedirs(os.path.dirname(save_keyframes_video_path) or ".", exist_ok=True)
         write_video_tensor(save_keyframes_video_path, keyframes_tensor, fps=float(fps_src))
     timing["save_keyframes_video_sec"] = float(time.perf_counter() - t0)
-
-    if len(init_frames) > target_len:
-        raise ValueError(
-            f"initial frames ({len(init_frames)}) > target_len ({target_len}). "
-            f"请先降低 keyframes_k 或调高 target_fps。"
-        )
 
     # -------- 插帧器与打分器 --------
     t0 = time.perf_counter()

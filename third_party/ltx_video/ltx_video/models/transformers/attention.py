@@ -1119,7 +1119,21 @@ class AttnProcessor2_0:
             # concat to key/value along seq dim
             key = torch.cat([extra_key, key], dim=2)
             value = torch.cat([extra_val, value], dim=2)
-            # NOTE: attention_mask not extended here; assume None or already compatible.
+            # extend attention_mask so kv_len matches key.shape[2] (extra_seq + text_seq)
+            if attention_mask is not None:
+                extra_seq = extra_key.shape[2]
+                # attention_mask is (batch, heads, q_len, kv_len); prepend mask for extra
+                dtype = attention_mask.dtype
+                device = attention_mask.device
+                extra_mask = torch.zeros(
+                    batch_size,
+                    attn.heads,
+                    attention_mask.shape[2],
+                    extra_seq,
+                    device=device,
+                    dtype=dtype,
+                )
+                attention_mask = torch.cat([extra_mask, attention_mask], dim=-1)
 
         # ==========================================================
         # [PATCH] Attention entropy collection (self-attn only)

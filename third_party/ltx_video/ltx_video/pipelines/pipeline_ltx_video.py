@@ -1237,13 +1237,14 @@ class LTXVideoPipeline(DiffusionPipeline):
             v = hs.mean(dim=1)  # [B,D]
 
             # get timestep embedding from AdaLN-single (same module transformer uses)
-            ts, _emb = self.transformer.adaln_single(
+            # first return is linear(silu(emb)) [B, 4*D or 6*D]; second is emb [B, D] matching patchify_proj
+            _scale_shift, timestep_emb = self.transformer.adaln_single(
                 current_timestep_1d.flatten(),
                 {"resolution": None, "aspect_ratio": None},
                 batch_size=v.shape[0],
                 hidden_dtype=hs.dtype,
-            )  # ts: [B,D]
-            return (v + ts).float()  # [B,D] float32
+            )
+            return (v + timestep_emb).float()  # [B,D] float32
 
         entropy_collector = _EntropyCollector(entropy_ema_alpha)
         pruned = False
@@ -1741,7 +1742,7 @@ class LTXVideoPipeline(DiffusionPipeline):
                 latents,
                 self.vae,
                 is_video,
-                vae_per_channel_normalize=kwargs["vae_per_channel_normalize"],
+                vae_per_channel_normalize=kwargs.get("vae_per_channel_normalize", True),
                 timestep=decode_timestep,
             )
 
