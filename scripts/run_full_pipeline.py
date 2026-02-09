@@ -142,6 +142,7 @@ def main() -> None:
     p.add_argument("--ltx_use_nonkey_context", action="store_true")
     p.add_argument("--ltx_no_nonkey_context", action="store_true")
     p.add_argument("--ltx_keyframe_out_fps", type=float, default=None)
+    p.add_argument("--ltx_keyframe_target_fps", type=float, default=None)
 
     p.add_argument(
         "--ltx_nonkey_update_mode",
@@ -390,6 +391,7 @@ def main() -> None:
         keyframe_cover=ltx_keyframe_cover,
         use_nonkey_context=ltx_use_nonkey_context,
         keyframe_out_fps=args.ltx_keyframe_out_fps,
+        keyframe_target_fps=args.ltx_keyframe_target_fps,
         nonkey_update_mode=args.ltx_nonkey_update_mode,
         nonkey_update_interval=args.ltx_nonkey_update_interval,
         teacache_rel_l1_thresh=args.ltx_teacache_rel_l1_thresh,

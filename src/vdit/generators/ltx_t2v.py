@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
 import sys
+import math
 
 import torch
 
@@ -58,6 +59,7 @@ class LtxGenerateConfig:
 
     # effective fps after prune (optional override)
     keyframe_out_fps: Optional[float] = None
+    keyframe_target_fps: Optional[float] = None
 
     # ---- nonkey_update_mode: none / interval / teacache ----
     nonkey_update_mode: str = "none"
@@ -65,6 +67,43 @@ class LtxGenerateConfig:
     teacache_rel_l1_thresh: float = 0.02
     teacache_max_skip: int = 8
     teacache_warmup: int = 2
+
+
+def auto_keyframe_topk_ltx(
+    frame_num_full: int,
+    fps_full: float,
+    fps_key: float,
+    stride_t: int,
+    min_k: int = 2,
+    max_k: Optional[int] = None,
+) -> int:
+    """
+    LTX 版本：根据目标关键帧视频 fps 自动估计 latent 关键帧数量 K。
+    近似关系：pixel_frames ≈ latent_frames * stride_t
+    """
+    if fps_key is None:
+        raise ValueError("fps_key is None")
+    if fps_key <= 0:
+        raise ValueError(f"fps_key must be > 0, got {fps_key}")
+    if fps_full <= 0:
+        raise ValueError(f"fps_full must be > 0, got {fps_full}")
+    if frame_num_full <= 1:
+        return max(min_k, 1)
+    if stride_t <= 0:
+        raise ValueError(f"stride_t must be > 0, got {stride_t}")
+
+    # 目标关键帧视频想保留的像素帧数（近似保持时长一致）
+    t_key = int(round(frame_num_full * (fps_key / float(fps_full))))
+    t_key = max(1, t_key)
+
+    # LTX: pixel_frames ≈ latent_frames * stride_t
+    k = int(math.ceil(t_key / float(stride_t)))
+    k = max(min_k, k)
+
+    if max_k is not None:
+        k = min(max_k, k)
+
+    return k
 
 
 def _ltx_video_to_vdit_frames(video_bcfhw: torch.Tensor) -> torch.Tensor:
@@ -108,6 +147,33 @@ def generate_ltx_frames(
         enhance_prompt=False,
     )
 
+    # ---- WAN-style: keyframe_target_fps -> auto keyframe_topk ----
+    keyframe_topk = int(cfg.keyframe_topk)
+    keyframe_out_fps = cfg.keyframe_out_fps
+
+    if cfg.keyframe_by_entropy and cfg.keyframe_target_fps is not None:
+        # temporal downscale (latent->pixel) from VAE
+        from ltx_video.models.autoencoders.vae_encode import (  # type: ignore
+            get_vae_size_scale_factor,
+        )
+
+        stride_t = int(get_vae_size_scale_factor(pipe.vae)[0])
+        # 最大 latent 帧数（避免 topk 过大）
+        max_k = int(math.ceil(int(cfg.num_frames) / float(stride_t)))
+
+        keyframe_topk = auto_keyframe_topk_ltx(
+            frame_num_full=int(cfg.num_frames),
+            fps_full=float(cfg.frame_rate),
+            fps_key=float(cfg.keyframe_target_fps),
+            stride_t=stride_t,
+            min_k=2,
+            max_k=max_k,
+        )
+
+        # 行为对齐 WAN：如果用户没显式给 out_fps，就默认用 target_fps
+        if keyframe_out_fps is None:
+            keyframe_out_fps = float(cfg.keyframe_target_fps)
+
     g = torch.Generator(device=cfg.device).manual_seed(int(cfg.seed))
 
     out = pipe(
@@ -134,7 +200,7 @@ def generate_ltx_frames(
         entropy_mode=str(cfg.entropy_mode),
         entropy_ema_alpha=float(cfg.entropy_ema_alpha),
         entropy_block_idx=int(cfg.entropy_block_idx),
-        keyframe_topk=int(cfg.keyframe_topk),
+        keyframe_topk=int(keyframe_topk),
         keyframe_cover=bool(cfg.keyframe_cover),
         use_nonkey_context=bool(cfg.use_nonkey_context),
         nonkey_update_mode=str(cfg.nonkey_update_mode),
@@ -154,8 +220,8 @@ def generate_ltx_frames(
         t_full = int(cfg.num_frames)
         if t_full > 0:
             fps_tgt = fps_src * (t_out / float(t_full))
-        if cfg.keyframe_out_fps is not None:
-            fps_tgt = float(cfg.keyframe_out_fps)
+        if keyframe_out_fps is not None:
+            fps_tgt = float(keyframe_out_fps)
 
     del video
     try:
