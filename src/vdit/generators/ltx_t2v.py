@@ -176,13 +176,32 @@ def generate_ltx_frames(
 
     g = torch.Generator(device=cfg.device).manual_seed(int(cfg.seed))
 
+    # ---- Match official LTX inference behavior: pad num_frames and force video mode ----
+    # scale factor from pipeline (fallback to 8 if missing)
+    video_scale_factor = int(getattr(pipe, "video_scale_factor", 8))
+    if video_scale_factor <= 0:
+        video_scale_factor = 8
+
+    if int(cfg.num_frames) < 1:
+        raise ValueError(f"cfg.num_frames must be >= 1, got {cfg.num_frames}")
+
+    if int(cfg.num_frames) == 1:
+        num_frames_padded = 1
+    else:
+        num_frames_padded = (
+            ((int(cfg.num_frames) - 2) // video_scale_factor + 1) * video_scale_factor + 1
+        )
+
+    # Use a more stable default negative prompt (close to official examples)
+    negative_prompt = "worst quality, inconsistent motion, blurry, jittery, distorted"
+
     out = pipe(
-        height=cfg.height,
-        width=cfg.width,
-        num_frames=cfg.num_frames,
+        height=int(cfg.height),
+        width=int(cfg.width),
+        num_frames=int(num_frames_padded),
         frame_rate=float(cfg.frame_rate),
         prompt=prompt,
-        negative_prompt="",
+        negative_prompt=negative_prompt,
         num_inference_steps=int(cfg.num_inference_steps),
         guidance_scale=float(cfg.guidance_scale),
         stg_scale=float(cfg.stg_scale),
@@ -194,6 +213,10 @@ def generate_ltx_frames(
         generator=g,
         output_type="pt",
         return_dict=True,
+        # tell LTX pipeline this is a video run
+        is_video=True,
+        vae_per_channel_normalize=True,
+        image_cond_noise_scale=0.0,
         # WAN-style prune + nonkey update
         keyframe_by_entropy=bool(cfg.keyframe_by_entropy),
         entropy_steps=int(cfg.entropy_steps),
@@ -211,6 +234,11 @@ def generate_ltx_frames(
     )
 
     video = out.images  # [B,C,F,H,W]
+
+    # Crop back to requested number of frames (official inference also crops)
+    if video.ndim == 5 and int(cfg.num_frames) > 0:
+        video = video[:, :, : int(cfg.num_frames), :, :]
+
     frames = _ltx_video_to_vdit_frames(video)
 
     fps_src = float(cfg.frame_rate)
@@ -222,6 +250,18 @@ def generate_ltx_frames(
             fps_tgt = fps_src * (t_out / float(t_full))
         if keyframe_out_fps is not None:
             fps_tgt = float(keyframe_out_fps)
+
+    # Simple debug print to help sanity-check num_frames/fps behavior
+    try:
+        print(
+            f"[LTX] out_frames={int(frames.shape[0])} "
+            f"fps={float(fps_tgt)} "
+            f"num_frames_cfg={int(cfg.num_frames)} "
+            f"frame_rate_cfg={float(cfg.frame_rate)}",
+            flush=True,
+        )
+    except Exception:
+        pass
 
     del video
     try:
