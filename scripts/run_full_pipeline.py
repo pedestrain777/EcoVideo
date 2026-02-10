@@ -155,6 +155,26 @@ def main() -> None:
     p.add_argument("--ltx_teacache_max_skip", type=int, default=8)
     p.add_argument("--ltx_teacache_warmup", type=int, default=2)
 
+    # -------- LTX multi-scale (official pipeline yaml) --------
+    p.add_argument(
+        "--ltx_pipeline_config",
+        type=str,
+        default=None,
+        help="Path to official LTX pipeline yaml. If pipeline_type=multi-scale, enables multi-scale pipeline.",
+    )
+    p.add_argument(
+        "--ltx_spatial_upscaler_ckpt",
+        type=str,
+        default=None,
+        help="Override spatial_upscaler_model_path in yaml with an absolute local ckpt path.",
+    )
+    p.add_argument(
+        "--ltx_downscale_factor",
+        type=float,
+        default=None,
+        help="Override downscale_factor in yaml (only used when multi-scale).",
+    )
+
     # -------- 插帧参数（你原来的 pipeline 参数）--------
     p.add_argument("--eden_config", type=str, required=True)
     p.add_argument("--output_path", type=str, default="interpolation_outputs/final.mp4")
@@ -397,6 +417,9 @@ def main() -> None:
         teacache_rel_l1_thresh=args.ltx_teacache_rel_l1_thresh,
         teacache_max_skip=args.ltx_teacache_max_skip,
         teacache_warmup=args.ltx_teacache_warmup,
+        pipeline_config_path=args.ltx_pipeline_config,
+        spatial_upscaler_ckpt=args.ltx_spatial_upscaler_ckpt,
+        downscale_factor=args.ltx_downscale_factor,
     )
 
     full_cfg = FullPipelineConfig(

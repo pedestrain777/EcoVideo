@@ -5,8 +5,10 @@ from pathlib import Path
 from typing import Optional, Tuple
 import sys
 import math
+import os
 
 import torch
+import yaml
 
 from vdit.generators.base import register_generator
 
@@ -22,6 +24,9 @@ except Exception:
     import ltx_video  # type: ignore
 
 from ltx_video.inference import create_ltx_video_pipeline  # type: ignore
+from ltx_video.pipelines.pipeline_ltx_video import LTXMultiScalePipeline  # type: ignore
+from ltx_video.models.autoencoders.latent_upsampler import LatentUpsampler  # type: ignore
+from ltx_video.utils.skip_layer_strategy import SkipLayerStrategy  # type: ignore
 
 
 @dataclass(frozen=True)
@@ -67,6 +72,11 @@ class LtxGenerateConfig:
     teacache_rel_l1_thresh: float = 0.02
     teacache_max_skip: int = 8
     teacache_warmup: int = 2
+
+    # ---- multi-scale (official pipeline yaml) ----
+    pipeline_config_path: Optional[str] = None  # official yaml path
+    spatial_upscaler_ckpt: Optional[str] = None  # override yaml spatial_upscaler_model_path
+    downscale_factor: Optional[float] = None  # override yaml downscale_factor
 
 
 def auto_keyframe_topk_ltx(
@@ -130,6 +140,53 @@ def _ltx_video_to_vdit_frames(video_bcfhw: torch.Tensor) -> torch.Tensor:
     return frames.float().cpu()
 
 
+def _pad_to_multiple(x: int, m: int) -> int:
+    return ((x - 1) // m + 1) * m
+
+
+def _pad_num_frames_ltx(num_frames: int, video_scale_factor: int) -> int:
+    # official: (N*8 + 1) style; generalized to video_scale_factor
+    if num_frames <= 1:
+        return 1
+    return ((num_frames - 2) // video_scale_factor + 1) * video_scale_factor + 1
+
+
+def _calc_center_padding(
+    src_h: int, src_w: int, tgt_h: int, tgt_w: int
+) -> Tuple[int, int, int, int]:
+    # returns (pad_left, pad_right, pad_top, pad_bottom) as in official inference
+    pad_h = tgt_h - src_h
+    pad_w = tgt_w - src_w
+    pad_top = pad_h // 2
+    pad_bottom = pad_h - pad_top
+    pad_left = pad_w // 2
+    pad_right = pad_w - pad_left
+    return (pad_left, pad_right, pad_top, pad_bottom)
+
+
+def _stg_mode_to_strategy(stg_mode: Optional[str]) -> Optional[SkipLayerStrategy]:
+    if not stg_mode:
+        return None
+    s = stg_mode.lower()
+    if s in ("stg_av", "attention_values"):
+        return SkipLayerStrategy.AttentionValues
+    if s in ("stg_as", "attention_skip"):
+        return SkipLayerStrategy.AttentionSkip
+    if s in ("stg_r", "residual"):
+        return SkipLayerStrategy.Residual
+    if s in ("stg_t", "transformer_block"):
+        return SkipLayerStrategy.TransformerBlock
+    raise ValueError(f"Invalid stg_mode: {stg_mode}")
+
+
+def _load_pipeline_yaml(path: str) -> dict:
+    with open(path, "r") as f:
+        obj = yaml.safe_load(f)
+    if not isinstance(obj, dict):
+        raise ValueError(f"pipeline yaml must be a dict, got {type(obj)}")
+    return obj
+
+
 @torch.no_grad()
 def generate_ltx_frames(
     *,
@@ -147,18 +204,26 @@ def generate_ltx_frames(
         enhance_prompt=False,
     )
 
+    # ---- Optional: load official pipeline yaml (enables multi-scale) ----
+    pipeline_cfg: Optional[dict] = None
+    pipeline_type = None
+    skip_layer_strategy: Optional[SkipLayerStrategy] = None
+
+    if cfg.pipeline_config_path:
+        pipeline_cfg = _load_pipeline_yaml(cfg.pipeline_config_path)
+        pipeline_type = pipeline_cfg.get("pipeline_type", None)
+        skip_layer_strategy = _stg_mode_to_strategy(pipeline_cfg.get("stg_mode", None))
+
     # ---- WAN-style: keyframe_target_fps -> auto keyframe_topk ----
     keyframe_topk = int(cfg.keyframe_topk)
     keyframe_out_fps = cfg.keyframe_out_fps
 
     if cfg.keyframe_by_entropy and cfg.keyframe_target_fps is not None:
-        # temporal downscale (latent->pixel) from VAE
         from ltx_video.models.autoencoders.vae_encode import (  # type: ignore
             get_vae_size_scale_factor,
         )
 
         stride_t = int(get_vae_size_scale_factor(pipe.vae)[0])
-        # 最大 latent 帧数（避免 topk 过大）
         max_k = int(math.ceil(int(cfg.num_frames) / float(stride_t)))
 
         keyframe_topk = auto_keyframe_topk_ltx(
@@ -169,75 +234,172 @@ def generate_ltx_frames(
             min_k=2,
             max_k=max_k,
         )
-
-        # 行为对齐 WAN：如果用户没显式给 out_fps，就默认用 target_fps
         if keyframe_out_fps is None:
             keyframe_out_fps = float(cfg.keyframe_target_fps)
 
     g = torch.Generator(device=cfg.device).manual_seed(int(cfg.seed))
 
-    # ---- Match official LTX inference behavior: pad num_frames and force video mode ----
-    # scale factor from pipeline (fallback to 8 if missing)
+    # ---- Official-style padding: H/W divisible by 32, frames -> (N*scale+1) ----
+    if int(cfg.num_frames) < 1:
+        raise ValueError(f"cfg.num_frames must be >= 1, got {cfg.num_frames}")
+
     video_scale_factor = int(getattr(pipe, "video_scale_factor", 8))
     if video_scale_factor <= 0:
         video_scale_factor = 8
 
-    if int(cfg.num_frames) < 1:
-        raise ValueError(f"cfg.num_frames must be >= 1, got {cfg.num_frames}")
+    height_padded = _pad_to_multiple(int(cfg.height), 32)
+    width_padded = _pad_to_multiple(int(cfg.width), 32)
+    num_frames_padded = _pad_num_frames_ltx(int(cfg.num_frames), video_scale_factor)
 
-    if int(cfg.num_frames) == 1:
-        num_frames_padded = 1
-    else:
-        num_frames_padded = (
-            ((int(cfg.num_frames) - 2) // video_scale_factor + 1) * video_scale_factor + 1
-        )
+    pad_left, pad_right, pad_top, pad_bottom = _calc_center_padding(
+        int(cfg.height), int(cfg.width), height_padded, width_padded
+    )
 
-    # Use a more stable default negative prompt (close to official examples)
     negative_prompt = "worst quality, inconsistent motion, blurry, jittery, distorted"
 
-    out = pipe(
-        height=int(cfg.height),
-        width=int(cfg.width),
+    base_kwargs = dict(
+        height=int(height_padded),
+        width=int(width_padded),
         num_frames=int(num_frames_padded),
         frame_rate=float(cfg.frame_rate),
         prompt=prompt,
         negative_prompt=negative_prompt,
-        num_inference_steps=int(cfg.num_inference_steps),
-        guidance_scale=float(cfg.guidance_scale),
-        stg_scale=float(cfg.stg_scale),
-        rescaling_scale=float(cfg.rescaling_scale),
-        cfg_star_rescale=bool(cfg.cfg_star_rescale),
-        mixed_precision=bool(cfg.mixed_precision),
-        offload_to_cpu=bool(cfg.offload_to_cpu),
-        stochastic_sampling=bool(cfg.stochastic_sampling),
         generator=g,
         output_type="pt",
         return_dict=True,
-        # tell LTX pipeline this is a video run
         is_video=True,
         vae_per_channel_normalize=True,
         image_cond_noise_scale=0.0,
-        # WAN-style prune + nonkey update
-        keyframe_by_entropy=bool(cfg.keyframe_by_entropy),
-        entropy_steps=int(cfg.entropy_steps),
-        entropy_mode=str(cfg.entropy_mode),
-        entropy_ema_alpha=float(cfg.entropy_ema_alpha),
-        entropy_block_idx=int(cfg.entropy_block_idx),
-        keyframe_topk=int(keyframe_topk),
-        keyframe_cover=bool(cfg.keyframe_cover),
-        use_nonkey_context=bool(cfg.use_nonkey_context),
-        nonkey_update_mode=str(cfg.nonkey_update_mode),
-        nonkey_update_interval=int(cfg.nonkey_update_interval),
-        teacache_rel_l1_thresh=float(cfg.teacache_rel_l1_thresh),
-        teacache_max_skip=int(cfg.teacache_max_skip),
-        teacache_warmup=int(cfg.teacache_warmup),
+        mixed_precision=bool(cfg.mixed_precision),
+        offload_to_cpu=bool(cfg.offload_to_cpu),
+        stochastic_sampling=bool(cfg.stochastic_sampling),
     )
+
+    # ---- pipeline_config kwargs (decode_timestep/noise, first_pass/second_pass, etc.) ----
+    call_cfg_kwargs: dict = {}
+    if pipeline_cfg:
+        call_cfg_kwargs.update(pipeline_cfg)
+        call_cfg_kwargs.pop("stg_mode", None)
+        call_cfg_kwargs.pop("checkpoint_path", None)
+        call_cfg_kwargs.pop("text_encoder_model_name_or_path", None)
+        call_cfg_kwargs.pop("precision", None)
+        call_cfg_kwargs.pop("sampler", None)
+        call_cfg_kwargs.pop("prompt_enhancer_image_caption_model_name_or_path", None)
+        call_cfg_kwargs.pop("prompt_enhancer_llm_model_name_or_path", None)
+        call_cfg_kwargs.pop("prompt_enhancement_words_threshold", None)
+        call_cfg_kwargs.pop("spatial_upscaler_model_path", None)
+        # Avoid passing duplicated kwargs that we already set via base_kwargs or explicit args.
+        # These may appear in the yaml and would otherwise cause "multiple values for keyword argument".
+        call_cfg_kwargs.pop("downscale_factor", None)
+        call_cfg_kwargs.pop("stochastic_sampling", None)
+        # multi-scale pipeline also defines these; we control them explicitly
+        call_cfg_kwargs.pop("first_pass", None)
+        call_cfg_kwargs.pop("second_pass", None)
+
+    # ---- single-stage path (default) ----
+    if pipeline_type != "multi-scale":
+        out = pipe(
+            **base_kwargs,
+            num_inference_steps=int(cfg.num_inference_steps),
+            guidance_scale=float(cfg.guidance_scale),
+            stg_scale=float(cfg.stg_scale),
+            rescaling_scale=float(cfg.rescaling_scale),
+            cfg_star_rescale=bool(cfg.cfg_star_rescale),
+            skip_layer_strategy=skip_layer_strategy,
+            keyframe_by_entropy=bool(cfg.keyframe_by_entropy),
+            entropy_steps=int(cfg.entropy_steps),
+            entropy_mode=str(cfg.entropy_mode),
+            entropy_ema_alpha=float(cfg.entropy_ema_alpha),
+            entropy_block_idx=int(cfg.entropy_block_idx),
+            keyframe_topk=int(keyframe_topk),
+            keyframe_cover=bool(cfg.keyframe_cover),
+            use_nonkey_context=bool(cfg.use_nonkey_context),
+            nonkey_update_mode=str(cfg.nonkey_update_mode),
+            nonkey_update_interval=int(cfg.nonkey_update_interval),
+            teacache_rel_l1_thresh=float(cfg.teacache_rel_l1_thresh),
+            teacache_max_skip=int(cfg.teacache_max_skip),
+            teacache_warmup=int(cfg.teacache_warmup),
+            **call_cfg_kwargs,
+        )
+    else:
+        # ---- multi-scale: wrap pipeline + inject entropy only into first_pass ----
+        downscale_factor = float(
+            pipeline_cfg.get("downscale_factor", 0.6666666)
+        ) if pipeline_cfg else 0.6666666
+        if cfg.downscale_factor is not None:
+            downscale_factor = float(cfg.downscale_factor)
+
+        up_path = None
+        if cfg.spatial_upscaler_ckpt:
+            up_path = cfg.spatial_upscaler_ckpt
+        else:
+            rel = (pipeline_cfg or {}).get("spatial_upscaler_model_path", None)
+            if not rel:
+                raise ValueError(
+                    "multi-scale requires spatial upscaler ckpt. "
+                    "Provide --ltx_spatial_upscaler_ckpt or set spatial_upscaler_model_path in yaml."
+                )
+            ydir = Path(cfg.pipeline_config_path).resolve().parent  # type: ignore[arg-type]
+            rel_str = str(rel)
+            up_path = (
+                str((ydir / rel_str).resolve())
+                if not os.path.isabs(rel_str)
+                else rel_str
+            )
+
+        latent_upsampler = LatentUpsampler.from_pretrained(up_path).to(cfg.device).eval()
+        pipe_ms = LTXMultiScalePipeline(pipe, latent_upsampler=latent_upsampler)
+
+        first_pass = dict((pipeline_cfg or {}).get("first_pass", {}) or {})
+        second_pass = dict((pipeline_cfg or {}).get("second_pass", {}) or {})
+
+        if bool(cfg.keyframe_by_entropy):
+            first_pass.update(
+                dict(
+                    keyframe_by_entropy=True,
+                    entropy_steps=int(cfg.entropy_steps),
+                    entropy_mode=str(cfg.entropy_mode),
+                    entropy_ema_alpha=float(cfg.entropy_ema_alpha),
+                    entropy_block_idx=int(cfg.entropy_block_idx),
+                    keyframe_topk=int(keyframe_topk),
+                    keyframe_cover=bool(cfg.keyframe_cover),
+                    use_nonkey_context=bool(cfg.use_nonkey_context),
+                    nonkey_update_mode=str(cfg.nonkey_update_mode),
+                    nonkey_update_interval=int(cfg.nonkey_update_interval),
+                    teacache_rel_l1_thresh=float(cfg.teacache_rel_l1_thresh),
+                    teacache_max_skip=int(cfg.teacache_max_skip),
+                    teacache_warmup=int(cfg.teacache_warmup),
+                )
+            )
+            second_pass.update(
+                dict(
+                    keyframe_by_entropy=False,
+                    nonkey_update_mode="none",
+                    use_nonkey_context=False,
+                )
+            )
+
+        out = pipe_ms(
+            downscale_factor=downscale_factor,
+            first_pass=first_pass,
+            second_pass=second_pass,
+            **base_kwargs,
+            skip_layer_strategy=skip_layer_strategy,
+            **call_cfg_kwargs,
+        )
 
     video = out.images  # [B,C,F,H,W]
 
-    # Crop back to requested number of frames (official inference also crops)
-    if video.ndim == 5 and int(cfg.num_frames) > 0:
+    # ---- crop back to requested frames and spatial size ----
+    if video.ndim == 5:
         video = video[:, :, : int(cfg.num_frames), :, :]
+
+        if (height_padded != int(cfg.height)) or (width_padded != int(cfg.width)):
+            h0 = pad_top
+            h1 = height_padded - pad_bottom
+            w0 = pad_left
+            w1 = width_padded - pad_right
+            video = video[:, :, :, h0:h1, w0:w1]
 
     frames = _ltx_video_to_vdit_frames(video)
 

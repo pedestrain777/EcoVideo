@@ -1631,6 +1631,12 @@ class LTXVideoPipeline(DiffusionPipeline):
                     and (not pruned)
                     and (i == int(entropy_steps) - 1)
                 ):
+                    # Always print when the pruning gate is reached (logger.info may be filtered out)
+                    print(
+                        f"[entropy-prune] Gate reached @i={i} (entropy_steps={entropy_steps}): "
+                        f"latents.shape={tuple(latents.shape)} "
+                        f"(tokens={latents.shape[1]}), num_cond_latents={num_cond_latents}"
+                    )
                     ent = entropy_collector.final(entropy_mode)
                     if ent is not None:
                         ent_1d = ent[0]  # [F]
@@ -1660,12 +1666,26 @@ class LTXVideoPipeline(DiffusionPipeline):
                         is_key = torch.isin(fid0, keyframe_ids)
                         keep = keep | is_key
 
+                        print(
+                            f"[entropy-prune] keep.sum={int(keep.sum().item())} "
+                            f"(keyframes_selected={int(keyframe_ids.numel()) if torch.is_tensor(keyframe_ids) else len(keyframe_ids)})"
+                        )
+
                         # prune main tensors
                         latents = latents[:, keep]
                         pixel_coords = pixel_coords[:, :, keep]
                         init_latents = init_latents[:, keep]
                         if orig_conditioning_mask is not None:
                             orig_conditioning_mask = orig_conditioning_mask[:, keep]
+                        print(
+                            f"[entropy-prune] After pruning: latents.shape={tuple(latents.shape)} "
+                            f"(tokens={latents.shape[1]})"
+                        )
+                    else:
+                        print(
+                            f"[entropy-prune] entropy_collector.final(...) returned None; "
+                            f"skipping pruning."
+                        )
 
                         # create non-key tensors (exclude conditioning prefix)
                         nonkeep = (~keep).clone()
