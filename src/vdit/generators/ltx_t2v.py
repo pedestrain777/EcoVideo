@@ -392,7 +392,10 @@ def generate_ltx_frames(
 
     # ---- crop back to requested frames and spatial size ----
     if video.ndim == 5:
-        video = video[:, :, : int(cfg.num_frames), :, :]
+        # In entropy keyframe mode (including multi-scale), the output is intentionally
+        # shorter than cfg.num_frames, so we do NOT force-crop to cfg.num_frames.
+        if not cfg.keyframe_by_entropy:
+            video = video[:, :, : int(cfg.num_frames), :, :]
 
         if (height_padded != int(cfg.height)) or (width_padded != int(cfg.width)):
             h0 = pad_top

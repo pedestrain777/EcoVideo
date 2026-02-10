@@ -2299,6 +2299,29 @@ class LTXMultiScalePipeline:
         result = self.video_pipeline(*args, **kwargs)
         latents = result.images
 
+        # -----------------------------
+        # Fix for entropy-prune keyframes:
+        # first_pass may prune tokens and reduce temporal latent length (F),
+        # so second pass must use a consistent num_frames, otherwise prepare_latents asserts.
+        # -----------------------------
+        try:
+            if first_pass.get("keyframe_by_entropy", False):
+                f_lat = int(latents.shape[2])
+                vsf = int(getattr(self.video_pipeline, "video_scale_factor", 1))
+                is_video = bool(kwargs.get("is_video", False))
+
+                if is_video and vsf > 1:
+                    # LTX causal VAE expects: latent_num_frames = num_frames//vsf + 1
+                    # choose num_frames so that latent_num_frames == f_lat
+                    # num_frames = (f_lat - 1) * vsf + 1
+                    fixed_num_frames = (f_lat - 1) * vsf + 1
+                else:
+                    fixed_num_frames = f_lat
+
+                original_kwargs["num_frames"] = int(fixed_num_frames)
+        except Exception:
+            pass
+
         upsampled_latents = self._upsample_latents(self.latent_upsampler, latents)
         upsampled_latents = adain_filter_latent(
             latents=upsampled_latents, reference_latents=latents
