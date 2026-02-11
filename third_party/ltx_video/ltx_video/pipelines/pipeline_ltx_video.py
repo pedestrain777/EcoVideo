@@ -954,6 +954,7 @@ class LTXVideoPipeline(DiffusionPipeline):
             "media_item or latents should be provided."
         )
 
+        num_inference_steps_arg = num_inference_steps
         timesteps, num_inference_steps = retrieve_timesteps(
             self.scheduler,
             num_inference_steps,
@@ -962,6 +963,18 @@ class LTXVideoPipeline(DiffusionPipeline):
             skip_initial_inference_steps=skip_initial_inference_steps,
             skip_final_inference_steps=skip_final_inference_steps,
             **retrieve_timesteps_kwargs,
+        )
+        print(
+            "[LTX] FINAL schedule:",
+            "len(timesteps)=",
+            len(timesteps),
+            "num_inference_steps(arg)=",
+            num_inference_steps_arg,
+            "skip_initial=",
+            skip_initial_inference_steps,
+            "skip_final=",
+            skip_final_inference_steps,
+            flush=True,
         )
 
         # Clamp entropy_steps to available timesteps (WAN-like behavior)
@@ -1086,6 +1099,7 @@ class LTXVideoPipeline(DiffusionPipeline):
             ],
             dim=0,
         )
+
         # 4. Prepare the initial latents using the provided media and conditioning items
 
         # Prepare the initial latents tensor, shape = (b, c, f, h, w)
@@ -2296,8 +2310,16 @@ class LTXMultiScalePipeline:
         kwargs["width"] = downscaled_width
         kwargs["height"] = downscaled_height
         kwargs.update(**first_pass)
+        print("[LTX-MS] entering FIRST pass")
         result = self.video_pipeline(*args, **kwargs)
         latents = result.images
+        try:
+            print(
+                "[LTX-MS] FIRST pass done, latents:",
+                tuple(latents.shape),
+            )
+        except Exception:
+            pass
 
         # -----------------------------
         # Fix for entropy-prune keyframes:
@@ -2334,6 +2356,22 @@ class LTXMultiScalePipeline:
         kwargs["width"] = downscaled_width * 2
         kwargs["height"] = downscaled_height * 2
         kwargs.update(**second_pass)
+        print(
+            "[LTX-MS] second_pass kwargs(after update):",
+            "num_inference_steps=",
+            kwargs.get("num_inference_steps"),
+            "skip_initial_inference_steps=",
+            kwargs.get("skip_initial_inference_steps"),
+            "skip_final_inference_steps=",
+            kwargs.get("skip_final_inference_steps"),
+            "width=",
+            kwargs.get("width"),
+            "height=",
+            kwargs.get("height"),
+            "num_frames=",
+            kwargs.get("num_frames"),
+            flush=True,
+        )
 
         result = self.video_pipeline(*args, **kwargs)
         if original_output_type != "latent":
