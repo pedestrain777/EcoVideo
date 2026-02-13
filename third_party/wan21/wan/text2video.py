@@ -28,6 +28,64 @@ from .utils.fm_solvers import (
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 
 
+def _save_entropy_curve_png(ent_frame, out_png, *, key_idx=None, title=None, dpi=220):
+    """Save a frame-level attention-entropy curve as a PNG.
+
+    Args:
+        ent_frame: 1D tensor/array-like with length F_latent.
+        out_png: output png path.
+        key_idx: optional 1D indices of selected keyframes (will be marked).
+        title: optional title string.
+        dpi: png dpi.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg", force=True)
+        import matplotlib.pyplot as plt
+        import numpy as np
+    except Exception as e:
+        logging.warning(f"[entropy-vis] matplotlib not available, skip saving {out_png}: {e}")
+        return
+
+    if isinstance(ent_frame, torch.Tensor):
+        y = ent_frame.detach().float().cpu().numpy()
+    else:
+        y = np.asarray(ent_frame, dtype=np.float32)
+
+    if y.ndim != 1 or y.size == 0:
+        logging.warning(f"[entropy-vis] invalid ent_frame shape {getattr(y, 'shape', None)}, skip {out_png}")
+        return
+
+    x = np.arange(y.size, dtype=np.int32)
+
+    out_dir = os.path.dirname(out_png)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    fig = plt.figure()
+    plt.plot(x, y)
+
+    if key_idx is not None:
+        if isinstance(key_idx, torch.Tensor):
+            k = key_idx.detach().cpu().numpy().astype(int).tolist()
+        else:
+            k = [int(v) for v in key_idx]
+        k = [vv for vv in k if 0 <= vv < y.size]
+        if len(k) > 0:
+            plt.scatter(np.asarray(k), y[np.asarray(k)], s=18)
+            for vv in k:
+                plt.axvline(vv, linewidth=0.6, alpha=0.5)
+
+    plt.xlabel("frame id (latent)")
+    plt.ylabel("frame attention entropy")
+    if title:
+        plt.title(title)
+    plt.grid(True, alpha=0.25)
+    plt.tight_layout()
+    fig.savefig(out_png, dpi=dpi)
+    plt.close(fig)
+
+
 class WanT2V:
 
     def __init__(
@@ -594,6 +652,15 @@ class WanT2V:
                         ent_frame,
                         os.path.join(debug_dir, f"entropy_frame_step_{step_i:02d}.pt"))
 
+                    # Save frame-level entropy curve for the last entropy step (a.k.a. "step 5" when entropy_steps=5)
+                    if step_i == entropy_steps - 1:
+                        out_png = os.path.join(debug_dir, f"entropy_curve_step_{step_i:02d}.png")
+                        _save_entropy_curve_png(
+                            ent_frame,
+                            out_png,
+                            title=f"frame entropy @ step {step_i} (block {entropy_block_idx})",
+                        )
+
                     if (collector.last_token is not None
                             and collector.last_grid_sizes is not None
                             and collector.last_seq_lens is not None):
@@ -628,6 +695,23 @@ class WanT2V:
                     ent_final = collector.final()[0]
                     key_idx = select_keyframes(
                         ent_final, keyframe_topk, cover=keyframe_cover)
+
+                    # (optional) save step entropy curve with selected keyframes marked
+                    if debug_dir is not None and self.rank == 0:
+                        try:
+                            ent_step = collector.last_frame[0].detach().cpu()
+                            out_png = os.path.join(
+                                debug_dir,
+                                f"entropy_curve_step_{step_i:02d}_keyframes.png",
+                            )
+                            _save_entropy_curve_png(
+                                ent_step,
+                                out_png,
+                                key_idx=key_idx.detach().cpu(),
+                                title=f"frame entropy @ step {step_i} (keyframes marked)",
+                            )
+                        except Exception as e:
+                            logging.warning(f"[entropy-vis] failed to save marked curve: {e}")
 
                     all_idx = torch.arange(
                         ent_final.numel(), device=key_idx.device)
