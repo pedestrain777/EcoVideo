@@ -4,25 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Literal, Optional, Tuple
-import sys
 from pathlib import Path
 
 import math
 import torch
 
 from vdit.generators.base import register_generator
-
-try:
-    import wan  # type: ignore
-except Exception:
-    _ROOT = Path(__file__).resolve().parents[3]
-    _WAN_ROOT = _ROOT / "third_party" / "wan"
-    if _WAN_ROOT.exists():
-        sys.path.insert(0, str(_WAN_ROOT))
-    import wan  # type: ignore
-
-from wan.configs import SIZE_CONFIGS, WAN_CONFIGS  # type: ignore
-from wan.utils.frame_sampling import resample_video_tensor  # type: ignore
+from vdit.generators.wan_pkg_loader import load_wan_package
 
 FrameSampleMode = Literal["uniform", "random", "stratified_random"]
 
@@ -56,6 +44,7 @@ def auto_keyframe_topk(
 @dataclass(frozen=True)
 class WanGenerateConfig:
     # -------- WAN 基本参数 --------
+    wan_version: str = "2.1"  # "2.1" or "2.2"
     task: str = "t2v-1.3B"  # baseline：wan1.3b
     size: str = "832*480"  # 1.3B 支持：480*832 / 832*480
     frame_num: int = 81  # WAN 默认视频帧数（通常 4n+1）
@@ -86,7 +75,7 @@ class WanGenerateConfig:
     save_debug_pt: bool = True
     profile_timing: bool = True
     keyframe_out_fps: Optional[float] = None
-    keyframe_target_fps: Optional[float] = None
+    keyframe_target_fps: Optional[float] = 8.0
 
     # -------- method-2: non-key low-frequency compute (TeaCache-style) --------
     nonkey_update_mode: str = "none"
@@ -130,86 +119,162 @@ def generate_wan_frames(
       frames: [T,3,H,W] float in [0,1] （CPU tensor）
       fps:    float (采样后 fps；若没设 out_fps 则为 WAN config 的 sample_fps)
     """
+    _root = Path(__file__).resolve().parents[3]
+    wan_mod = load_wan_package(_root, cfg.wan_version)
+
+    WAN_CONFIGS = wan_mod.configs.WAN_CONFIGS  # type: ignore[attr-defined]
+    SIZE_CONFIGS = wan_mod.configs.SIZE_CONFIGS  # type: ignore[attr-defined]
+
     if cfg.task not in WAN_CONFIGS:
-        raise ValueError(f"Unknown task: {cfg.task}. Valid: {list(WAN_CONFIGS.keys())}")
+        raise ValueError(
+            f"[wan{cfg.wan_version}] Unknown task: {cfg.task}. "
+            f"Valid: {list(WAN_CONFIGS.keys())}"
+        )
     if cfg.size not in SIZE_CONFIGS:
-        raise ValueError(f"Unknown size: {cfg.size}. Valid: {list(SIZE_CONFIGS.keys())}")
+        raise ValueError(
+            f"[wan{cfg.wan_version}] Unknown size: {cfg.size}. "
+            f"Valid: {list(SIZE_CONFIGS.keys())}"
+        )
 
     wan_cfg = WAN_CONFIGS[cfg.task]
     fps_src = float(getattr(wan_cfg, "sample_fps", 24.0))
     fps_tgt = fps_src
 
-    # 构建 WAN pipeline（单卡、非分布式：rank=0）
-    model = wan.WanT2V(
-        config=wan_cfg,
-        checkpoint_dir=ckpt_dir,
-        device_id=cfg.device_id,
-        rank=0,
-        t5_fsdp=False,
-        dit_fsdp=False,
-        use_usp=False,
-        t5_cpu=cfg.t5_cpu,
-    )
-
-    keyframe_topk = cfg.keyframe_topk
-    keyframe_out_fps = cfg.keyframe_out_fps
-    if cfg.keyframe_by_entropy and cfg.keyframe_target_fps is not None:
-        stride_t = int(model.vae_stride[0]) if hasattr(model, "vae_stride") else 4
-        max_k = (cfg.frame_num - 1) // stride_t + 1
-        keyframe_topk = auto_keyframe_topk(
-            frame_num_full=cfg.frame_num,
-            fps_full=float(fps_src),
-            fps_key=float(cfg.keyframe_target_fps),
-            stride_t=stride_t,
-            min_k=2,
-            max_k=max_k,
+    # ----- 构建 WAN pipeline（单卡、非分布式：rank=0）-----
+    if cfg.wan_version == "2.1":
+        model = wan_mod.WanT2V(  # type: ignore[attr-defined]
+            config=wan_cfg,
+            checkpoint_dir=ckpt_dir,
+            device_id=cfg.device_id,
+            rank=0,
+            t5_fsdp=False,
+            dit_fsdp=False,
+            use_usp=False,
+            t5_cpu=cfg.t5_cpu,
         )
-        if keyframe_out_fps is None:
-            keyframe_out_fps = float(cfg.keyframe_target_fps)
 
-    # 生成 WAN 原生视频张量：[C,T,H,W]
-    video = model.generate(
-        prompt,
-        size=SIZE_CONFIGS[cfg.size],
-        frame_num=cfg.frame_num,
-        shift=cfg.sample_shift,
-        sample_solver=cfg.sample_solver,
-        sampling_steps=cfg.sample_steps,
-        guide_scale=cfg.guide_scale,
-        seed=cfg.seed,
-        offload_model=cfg.offload_model,
-        keyframe_by_entropy=cfg.keyframe_by_entropy,
-        entropy_steps=cfg.entropy_steps,
-        entropy_mode=cfg.entropy_mode,
-        entropy_ema_alpha=cfg.entropy_ema_alpha,
-        entropy_block_idx=cfg.entropy_block_idx,
-        keyframe_topk=keyframe_topk,
-        keyframe_cover=cfg.keyframe_cover,
-        use_nonkey_context=cfg.use_nonkey_context,
-        debug_dir=cfg.debug_dir,
-        save_debug_pt=cfg.save_debug_pt,
-        profile_timing=cfg.profile_timing,
-        nonkey_update_mode=cfg.nonkey_update_mode,
-        nonkey_update_interval=cfg.nonkey_update_interval,
-        teacache_rel_l1_thresh=cfg.teacache_rel_l1_thresh,
-        teacache_max_skip=cfg.teacache_max_skip,
-        teacache_warmup=cfg.teacache_warmup,
-        save_teacache_trace_png=cfg.save_teacache_trace_png,
-    )
+        keyframe_topk = cfg.keyframe_topk
+        keyframe_out_fps = cfg.keyframe_out_fps
+        if cfg.keyframe_by_entropy and cfg.keyframe_target_fps is not None:
+            stride_t = int(
+                getattr(model, "vae_stride", [4])[0]  # type: ignore[index]
+            )
+            max_k = (cfg.frame_num - 1) // stride_t + 1
+            keyframe_topk = auto_keyframe_topk(
+                frame_num_full=cfg.frame_num,
+                fps_full=float(fps_src),
+                fps_key=float(cfg.keyframe_target_fps),
+                stride_t=stride_t,
+                min_k=2,
+                max_k=max_k,
+            )
+            if keyframe_out_fps is None:
+                keyframe_out_fps = float(cfg.keyframe_target_fps)
 
-    if cfg.keyframe_by_entropy:
-        t_out = int(video.shape[1])
-        t_full = int(cfg.frame_num)
-        if t_full > 0:
-            fps_tgt = fps_src * (t_out / float(t_full))
-        if keyframe_out_fps is not None:
-            fps_tgt = float(keyframe_out_fps)
+        # 生成 WAN2.1 原生视频张量：[C,T,H,W]
+        video = model.generate(
+            prompt,
+            size=SIZE_CONFIGS[cfg.size],
+            frame_num=cfg.frame_num,
+            shift=cfg.sample_shift,
+            sample_solver=cfg.sample_solver,
+            sampling_steps=cfg.sample_steps,
+            guide_scale=cfg.guide_scale,
+            seed=cfg.seed,
+            offload_model=cfg.offload_model,
+            keyframe_by_entropy=cfg.keyframe_by_entropy,
+            entropy_steps=cfg.entropy_steps,
+            entropy_mode=cfg.entropy_mode,
+            entropy_ema_alpha=cfg.entropy_ema_alpha,
+            entropy_block_idx=cfg.entropy_block_idx,
+            keyframe_topk=keyframe_topk,
+            keyframe_cover=cfg.keyframe_cover,
+            use_nonkey_context=cfg.use_nonkey_context,
+            debug_dir=cfg.debug_dir,
+            save_debug_pt=cfg.save_debug_pt,
+            profile_timing=cfg.profile_timing,
+            nonkey_update_mode=cfg.nonkey_update_mode,
+            nonkey_update_interval=cfg.nonkey_update_interval,
+            teacache_rel_l1_thresh=cfg.teacache_rel_l1_thresh,
+            teacache_max_skip=cfg.teacache_max_skip,
+            teacache_warmup=cfg.teacache_warmup,
+            save_teacache_trace_png=cfg.save_teacache_trace_png,
+        )
 
-    # 可选：按 out_fps 做“均匀/随机取帧”（保持时长不变）
-    if cfg.out_fps is not None and not cfg.keyframe_by_entropy:
+        if cfg.keyframe_by_entropy:
+            t_out = int(video.shape[1])
+            t_full = int(cfg.frame_num)
+            if t_full > 0:
+                fps_tgt = fps_src * (t_out / float(t_full))
+            if keyframe_out_fps is not None:
+                fps_tgt = float(keyframe_out_fps)
+
+    elif cfg.wan_version == "2.2":
+        if cfg.nonkey_update_mode != "none":
+            raise ValueError(
+                "wan2.2 path does not support nonkey_update_mode; "
+                "please set --wan_nonkey_update_mode none"
+            )
+
+        # Wan2.2 A14B pipeline（不支持 method-2，只用 entropy 选关键帧）
+        model = wan_mod.WanT2V(  # type: ignore[attr-defined]
+            config=wan_cfg,
+            checkpoint_dir=ckpt_dir,
+            device_id=cfg.device_id,
+            rank=0,
+            t5_fsdp=False,
+            dit_fsdp=False,
+            use_sp=False,
+            t5_cpu=cfg.t5_cpu,
+            convert_model_dtype=False,
+        )
+
+        target_fps = float(cfg.keyframe_target_fps or 8.0)
+
+        video = model.generate(
+            input_prompt=prompt,
+            size=SIZE_CONFIGS[cfg.size],
+            frame_num=cfg.frame_num,
+            shift=cfg.sample_shift,
+            sample_solver=cfg.sample_solver,
+            sampling_steps=cfg.sample_steps,
+            guide_scale=cfg.guide_scale,
+            n_prompt="",
+            seed=cfg.seed,
+            offload_model=cfg.offload_model,
+            keyframe_by_entropy=cfg.keyframe_by_entropy,
+            keyframe_target_fps=target_fps,
+            entropy_steps=cfg.entropy_steps,
+            entropy_mode=cfg.entropy_mode,
+            entropy_ema_alpha=cfg.entropy_ema_alpha,
+            entropy_block_idx=cfg.entropy_block_idx,
+            keyframe_cover=cfg.keyframe_cover,
+            debug_dir=cfg.debug_dir,
+            save_debug_pt=cfg.save_debug_pt,
+            profile_timing=cfg.profile_timing,
+        )
+
+        if cfg.keyframe_by_entropy:
+            fps_tgt = target_fps
+
+    else:
+        raise ValueError(f"Unsupported wan_version: {cfg.wan_version}")
+
+    # 可选：按 out_fps 做“均匀/随机取帧”（保持时长不变，仅支持 wan2.1）
+    if (cfg.wan_version == "2.1" and cfg.out_fps is not None
+            and not cfg.keyframe_by_entropy):
         fps_tgt = float(cfg.out_fps)
         if fps_tgt > 0 and abs(fps_tgt - fps_src) > 1e-6:
-            video, _idx = resample_video_tensor(
+            # 延迟从对应 wan 包获取 resample 函数，避免跨版本冲突
+            try:
+                fs_mod = wan_mod.utils.frame_sampling  # type: ignore[attr-defined]
+                resample_fn = fs_mod.resample_video_tensor
+            except Exception as exc:  # pragma: no cover - defensive
+                raise RuntimeError(
+                    "resample_video_tensor is not available in wan2.1 package."
+                ) from exc
+
+            video, _idx = resample_fn(
                 video,
                 fps_src=fps_src,
                 fps_tgt=fps_tgt,

@@ -32,8 +32,12 @@ def main() -> None:
     p.add_argument("--input_fps", type=float, default=None, help="Input video fps (auto-detect if not provided)")
 
     # WAN 生成参数（baseline：t2v-1.3B）
+    p.add_argument("--wan_version",
+                   type=str,
+                   default="2.1",
+                   choices=["2.1", "2.2"])
     p.add_argument("--wan_task", type=str, default="t2v-1.3B")
-    p.add_argument("--wan_size", type=str, default="832*480", choices=["832*480", "480*832"])
+    p.add_argument("--wan_size", type=str, default="832*480")
     p.add_argument("--wan_frame_num", type=int, default=81)
     p.add_argument("--wan_sample_solver", type=str, default="unipc", choices=["unipc", "dpm++"])
     p.add_argument("--wan_sample_steps", type=int, default=50)
@@ -70,7 +74,7 @@ def main() -> None:
     p.add_argument("--wan_profile_timing", action="store_true")
     p.add_argument("--wan_no_profile_timing", action="store_true")
     p.add_argument("--wan_keyframe_out_fps", type=float, default=None)
-    p.add_argument("--wan_keyframe_target_fps", type=float, default=None)
+    p.add_argument("--wan_keyframe_target_fps", type=float, default=8.0)
 
     # -------- WAN: method-2 non-key low-frequency compute --------
     p.add_argument("--wan_nonkey_update_mode",
@@ -225,6 +229,7 @@ def main() -> None:
         save_teacache_trace_png = True
 
     wan_cfg = WanGenerateConfig(
+        wan_version=args.wan_version,
         task=args.wan_task,
         size=args.wan_size,
         frame_num=args.wan_frame_num,

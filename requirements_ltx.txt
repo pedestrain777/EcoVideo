@@ -1,0 +1,15 @@
+# LTX-Video 额外依赖：在已有 VDiT 环境（如 zhy_vdit）上安装后可运行 --generator ltx
+# 使用方式：先安装 VDiT 基础依赖，再执行：
+#   pip install -r requirements_ltx.txt
+
+# LTX 必需（pyproject.toml）
+sentencepiece>=0.1.96
+timm
+
+# LTX 要求版本范围（与 requirements_no_occ.txt 兼容的升级）
+transformers>=4.47.2,<4.52.0
+huggingface-hub>=0.30,<0.31
+
+# 可选：LTX 官方要求 torch>=2.1.0；若当前为 torch 2.0.x 且运行 LTX 报错，可再执行：
+#   pip install 'torch>=2.1.0' 'torchvision>=0.16.0'
+# 升级后若 xformers 报错，可升级：pip install -U xformers
