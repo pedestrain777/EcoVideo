@@ -646,20 +646,26 @@ class WanT2V:
                     generator=seed_g)[0]
                 latents = [temp_x0.squeeze(0)]
 
+                # (debug) dump per-step frame entropy; at the last entropy step, also save a "last" curve PNG
+                # NOTE: keyframe selection may use an aggregated entropy (ema/mean/last) via collector.final();
+                # we intentionally save the instantaneous "last" curve here to visualize per-step dynamics.
                 if collect_entropy and debug_dir is not None and save_debug_pt and self.rank == 0:
-                    ent_frame = collector.last_frame[0].detach().cpu()
-                    torch.save(
-                        ent_frame,
-                        os.path.join(debug_dir, f"entropy_frame_step_{step_i:02d}.pt"))
+                    if collector.last_frame is None:
+                        logging.warning("[entropy-vis] collector.last_frame is None, skip per-step dump")
+                    else:
+                        ent_last = collector.last_frame[0].detach().cpu()
+                        torch.save(
+                            ent_last,
+                            os.path.join(debug_dir, f"entropy_frame_step_{step_i:02d}.pt"))
 
-                    # Save frame-level entropy curve for the last entropy step (a.k.a. "step 5" when entropy_steps=5)
-                    if step_i == entropy_steps - 1:
-                        out_png = os.path.join(debug_dir, f"entropy_curve_step_{step_i:02d}.png")
-                        _save_entropy_curve_png(
-                            ent_frame,
-                            out_png,
-                            title=f"frame entropy @ step {step_i} (block {entropy_block_idx})",
-                        )
+                        # Save the instantaneous curve at the end of entropy window (a.k.a. "step 5" when entropy_steps=5)
+                        if step_i == entropy_steps - 1:
+                            out_png = os.path.join(debug_dir, f"entropy_curve_step_{step_i:02d}_last.png")
+                            _save_entropy_curve_png(
+                                ent_last,
+                                out_png,
+                                title=f"frame entropy (last) @ step {step_i} (block {entropy_block_idx})",
+                            )
 
                     if (collector.last_token is not None
                             and collector.last_grid_sizes is not None
@@ -696,22 +702,26 @@ class WanT2V:
                     key_idx = select_keyframes(
                         ent_final, keyframe_topk, cover=keyframe_cover)
 
-                    # (optional) save step entropy curve with selected keyframes marked
+                    # Save the aggregated entropy curve used for keyframe selection (EMA if entropy_mode=ema)
+                    # with selected keyframes marked.
                     if debug_dir is not None and self.rank == 0:
                         try:
-                            ent_step = collector.last_frame[0].detach().cpu()
+                            ent_used = ent_final.detach().cpu()
                             out_png = os.path.join(
                                 debug_dir,
-                                f"entropy_curve_step_{step_i:02d}_keyframes.png",
+                                f"entropy_curve_final_{entropy_mode}_keyframes.png",
                             )
+                            title = f"frame entropy (final-{entropy_mode}) @ step {step_i} (keyframes marked)"
+                            if entropy_mode == "ema":
+                                title += f", alpha={entropy_ema_alpha}"
                             _save_entropy_curve_png(
-                                ent_step,
+                                ent_used,
                                 out_png,
                                 key_idx=key_idx.detach().cpu(),
-                                title=f"frame entropy @ step {step_i} (keyframes marked)",
+                                title=title,
                             )
                         except Exception as e:
-                            logging.warning(f"[entropy-vis] failed to save marked curve: {e}")
+                            logging.warning(f"[entropy-vis] failed to save final curve: {e}")
 
                     all_idx = torch.arange(
                         ent_final.numel(), device=key_idx.device)
