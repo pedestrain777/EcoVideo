@@ -279,7 +279,9 @@ class WanT2V:
                  keyframe_cover: bool = True,
                  debug_dir: str | None = None,
                  save_debug_pt: bool = True,
-                 profile_timing: bool = False):
+                 profile_timing: bool = False,
+                 save_latents_pt: str | None = None,
+                 save_latent_stats_json: str | None = None):
         r"""
         Generates video frames from text prompt using diffusion process.
 
@@ -682,6 +684,44 @@ class WanT2V:
                 self.high_noise_model.cpu()
                 torch.cuda.empty_cache()
             if self.rank == 0:
+                # ---- dump latent size before VAE decode (keyframes latent if entropy crop enabled) ----
+                latent = x0[0]  # torch.Tensor, [C_lat, T_lat, H_lat, W_lat]
+                tensor_bytes = int(latent.numel() * latent.element_size())
+
+                packed_bytes = None
+                try:
+                    import io
+                    buf = io.BytesIO()
+                    torch.save(latent.detach().cpu(), buf)
+                    packed_bytes = int(len(buf.getvalue()))
+                except Exception:
+                    pass
+
+                base64_bytes = None
+                if packed_bytes is not None:
+                    base64_bytes = int(4 * ((packed_bytes + 2) // 3))
+
+                stats = {
+                    "latent_shape": list(latent.shape),
+                    "latent_dtype": str(latent.dtype),
+                    "tensor_bytes": tensor_bytes,
+                    "packed_bytes": packed_bytes,
+                    "base64_bytes": base64_bytes,
+                }
+
+                if (save_latent_stats_json is None) and (debug_dir is not None):
+                    save_latent_stats_json = os.path.join(debug_dir, "wan_latent_size.json")
+
+                if save_latent_stats_json is not None:
+                    os.makedirs(os.path.dirname(save_latent_stats_json) or ".", exist_ok=True)
+                    import json
+                    with open(save_latent_stats_json, "w", encoding="utf-8") as f:
+                        json.dump(stats, f, indent=2)
+
+                if save_latents_pt is not None:
+                    os.makedirs(os.path.dirname(save_latents_pt) or ".", exist_ok=True)
+                    torch.save(latent.detach().cpu(), save_latents_pt)
+
                 videos = self.vae.decode(x0)
 
         del noise, latents
