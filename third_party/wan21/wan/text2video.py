@@ -183,6 +183,8 @@ class WanT2V:
                  seed=-1,
                  offload_model=True,
                  keyframe_by_entropy=False,
+                 keyframe_select_mode="entropy",  # "entropy" | "uniform" | "random" (ablation)
+                 keyframe_sample_seed=0,
                  entropy_steps=5,
                  entropy_mode="mean",
                  entropy_ema_alpha=0.6,
@@ -383,6 +385,71 @@ class WanT2V:
 
             return idx.sort().values
 
+        def sample_keyframes(f_lat, topk, cover, mode, seed, device):
+            """Uniform or random keyframe sampling (ablation, no entropy)."""
+            k = min(int(topk), int(f_lat))
+            if k <= 0:
+                return torch.arange(f_lat, device=device, dtype=torch.long)
+            if f_lat <= 1:
+                return torch.arange(f_lat, device=device, dtype=torch.long)
+
+            if mode == "uniform":
+                idx = torch.linspace(0, f_lat - 1, steps=k, device=device)
+                idx = torch.round(idx).long()
+                idx = torch.unique(idx)
+                if idx.numel() < k:
+                    all_idx = torch.arange(f_lat, device=device)
+                    mask = torch.ones(f_lat, dtype=torch.bool, device=device)
+                    mask[idx] = False
+                    extra = all_idx[mask][: (k - idx.numel())]
+                    idx = torch.cat([idx, extra], dim=0)
+                if cover and f_lat >= 2 and k >= 2:
+                    must = torch.tensor([0, f_lat - 1], device=device, dtype=torch.long)
+                    idx = torch.unique(torch.cat([idx, must], dim=0))
+                    if idx.numel() > k:
+                        idx_sorted = torch.sort(idx).values
+                        if k == 2:
+                            idx = must
+                        else:
+                            mid = idx_sorted[
+                                (idx_sorted != 0) & (idx_sorted != (f_lat - 1))
+                            ]
+                            need = k - 2
+                            idx = torch.cat(
+                                [
+                                    torch.tensor([0], device=device, dtype=torch.long),
+                                    mid[:need],
+                                    torch.tensor(
+                                        [f_lat - 1], device=device, dtype=torch.long
+                                    ),
+                                ],
+                                dim=0,
+                            )
+                return torch.sort(idx).values
+
+            if mode == "random":
+                g = torch.Generator(device="cpu")
+                g.manual_seed(int(seed))
+                if cover and f_lat >= 2 and k >= 2:
+                    if f_lat == 2:
+                        return torch.tensor([0, 1], device=device, dtype=torch.long)
+                    mid = torch.arange(1, f_lat - 1, device=device)
+                    perm = torch.randperm(mid.numel(), generator=g).to(device)
+                    take = mid[perm[: (k - 2)]]
+                    idx = torch.cat(
+                        [
+                            torch.tensor([0, f_lat - 1], device=device, dtype=torch.long),
+                            take,
+                        ],
+                        dim=0,
+                    )
+                else:
+                    perm = torch.randperm(f_lat, generator=g).to(device)
+                    idx = perm[:k]
+                return torch.sort(torch.unique(idx)).values
+
+            raise ValueError(f"Unknown keyframe_select_mode: {mode}")
+
         @torch.no_grad()
         def build_nonkey_extra_context(nonkey_latent, model):
             emb = model.patch_embedding(nonkey_latent.unsqueeze(0))
@@ -518,7 +585,11 @@ class WanT2V:
 
                 timestep = torch.stack(timestep)
 
-                collect_entropy = keyframe_by_entropy and (step_i < entropy_steps)
+                collect_entropy = (
+                    keyframe_by_entropy
+                    and (keyframe_select_mode == "entropy")
+                    and (step_i < entropy_steps)
+                )
                 collector.enabled = collect_entropy
 
                 self.model.to(self.device)
@@ -698,33 +769,47 @@ class WanT2V:
                             save_block_heatmap_png(map3d[fi], out_png, dpi=300)
 
                 if keyframe_by_entropy and step_i == entropy_steps - 1:
-                    ent_final = collector.final()[0]
-                    key_idx = select_keyframes(
-                        ent_final, keyframe_topk, cover=keyframe_cover)
+                    f_lat = latents[0].shape[1]
+                    if keyframe_select_mode == "entropy":
+                        ent_final = collector.final()[0]
+                        key_idx = select_keyframes(
+                            ent_final, keyframe_topk, cover=keyframe_cover)
+                        # Save the aggregated entropy curve (only when using entropy)
+                        if debug_dir is not None and self.rank == 0:
+                            try:
+                                ent_used = ent_final.detach().cpu()
+                                out_png = os.path.join(
+                                    debug_dir,
+                                    f"entropy_curve_final_{entropy_mode}_keyframes.png",
+                                )
+                                title = f"frame entropy (final-{entropy_mode}) @ step {step_i} (keyframes marked)"
+                                if entropy_mode == "ema":
+                                    title += f", alpha={entropy_ema_alpha}"
+                                _save_entropy_curve_png(
+                                    ent_used,
+                                    out_png,
+                                    key_idx=key_idx.detach().cpu(),
+                                    title=title,
+                                )
+                            except Exception as e:
+                                logging.warning(
+                                    f"[entropy-vis] failed to save final curve: {e}"
+                                )
+                    elif keyframe_select_mode in ("uniform", "random"):
+                        key_idx = sample_keyframes(
+                            f_lat=f_lat,
+                            topk=keyframe_topk,
+                            cover=keyframe_cover,
+                            mode=keyframe_select_mode,
+                            seed=keyframe_sample_seed,
+                            device=latents[0].device,
+                        )
+                    else:
+                        raise ValueError(
+                            f"Unknown keyframe_select_mode={keyframe_select_mode}"
+                        )
 
-                    # Save the aggregated entropy curve used for keyframe selection (EMA if entropy_mode=ema)
-                    # with selected keyframes marked.
-                    if debug_dir is not None and self.rank == 0:
-                        try:
-                            ent_used = ent_final.detach().cpu()
-                            out_png = os.path.join(
-                                debug_dir,
-                                f"entropy_curve_final_{entropy_mode}_keyframes.png",
-                            )
-                            title = f"frame entropy (final-{entropy_mode}) @ step {step_i} (keyframes marked)"
-                            if entropy_mode == "ema":
-                                title += f", alpha={entropy_ema_alpha}"
-                            _save_entropy_curve_png(
-                                ent_used,
-                                out_png,
-                                key_idx=key_idx.detach().cpu(),
-                                title=title,
-                            )
-                        except Exception as e:
-                            logging.warning(f"[entropy-vis] failed to save final curve: {e}")
-
-                    all_idx = torch.arange(
-                        ent_final.numel(), device=key_idx.device)
+                    all_idx = torch.arange(f_lat, device=key_idx.device)
                     mask = torch.ones_like(all_idx, dtype=torch.bool)
                     mask[key_idx] = False
                     nonkey_idx = all_idx[mask]
@@ -787,21 +872,21 @@ class WanT2V:
 
                     if debug_dir is not None and self.rank == 0:
                         torch.save(
-                            ent_final.detach().cpu(),
-                            os.path.join(
-                                debug_dir,
-                                f"entropy_frame_final_{entropy_mode}.pt"))
-                        torch.save(
                             key_idx.detach().cpu(),
                             os.path.join(debug_dir, "keyframes_idx_latent.pt"))
                         pixel_idx = (key_idx * self.vae_stride[0]).detach().cpu()
                         torch.save(
                             pixel_idx,
                             os.path.join(debug_dir, "keyframes_idx_pixel.pt"))
-
                         _log_debug(
-                            f"Selected {key_idx.numel()} keyframes (latent idx): "
+                            f"Selected {key_idx.numel()} keyframes (latent idx, mode={keyframe_select_mode}): "
                             f"{key_idx.detach().cpu().tolist()}")
+                        if keyframe_select_mode == "entropy":
+                            torch.save(
+                                ent_final.detach().cpu(),
+                                os.path.join(
+                                    debug_dir,
+                                    f"entropy_frame_final_{entropy_mode}.pt"))
 
             x0 = latents
             t_denoise_end = time.time()

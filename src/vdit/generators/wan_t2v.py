@@ -70,6 +70,8 @@ class WanGenerateConfig:
     entropy_block_idx: int = -1  # -1 = last block
     keyframe_topk: int = 16
     keyframe_cover: bool = True
+    keyframe_select_mode: str = "entropy"  # "entropy" | "uniform" | "random" (ablation)
+    keyframe_sample_seed: int = 0
     use_nonkey_context: bool = True
     debug_dir: Optional[str] = None
     save_debug_pt: bool = True
@@ -183,6 +185,8 @@ def generate_wan_frames(
             seed=cfg.seed,
             offload_model=cfg.offload_model,
             keyframe_by_entropy=cfg.keyframe_by_entropy,
+            keyframe_select_mode=cfg.keyframe_select_mode,
+            keyframe_sample_seed=cfg.keyframe_sample_seed,
             entropy_steps=cfg.entropy_steps,
             entropy_mode=cfg.entropy_mode,
             entropy_ema_alpha=cfg.entropy_ema_alpha,

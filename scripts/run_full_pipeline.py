@@ -66,6 +66,19 @@ def main() -> None:
     p.add_argument("--wan_keyframe_topk", type=int, default=16)
     p.add_argument("--wan_keyframe_cover", action="store_true")
     p.add_argument("--wan_no_keyframe_cover", action="store_true")
+    p.add_argument(
+        "--wan_keyframe_select_mode",
+        type=str,
+        default="entropy",
+        choices=["entropy", "uniform", "random"],
+        help="Keyframe selection at step5: entropy (default), uniform, or random (ablation).",
+    )
+    p.add_argument(
+        "--wan_keyframe_sample_seed",
+        type=int,
+        default=0,
+        help="Random seed for --wan_keyframe_select_mode random.",
+    )
     p.add_argument("--wan_use_nonkey_context", action="store_true")
     p.add_argument("--wan_no_nonkey_context", action="store_true")
     p.add_argument("--wan_entropy_debug_dir", type=str, default=None)
@@ -249,6 +262,8 @@ def main() -> None:
         entropy_block_idx=args.wan_entropy_block_idx,
         keyframe_topk=args.wan_keyframe_topk,
         keyframe_cover=keyframe_cover,
+        keyframe_select_mode=args.wan_keyframe_select_mode,
+        keyframe_sample_seed=args.wan_keyframe_sample_seed,
         use_nonkey_context=use_nonkey_context,
         debug_dir=args.wan_entropy_debug_dir,
         save_debug_pt=save_debug_pt,
