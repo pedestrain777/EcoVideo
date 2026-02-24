@@ -228,6 +228,10 @@ class CogVideoXAttnProcessor2_0ForEntropy(CogVideoXAttnProcessor2_0):
         collector: EntropyCollector,
         use_nonkey_context: bool = True,
         cond_only: bool = False,
+        # ---- memory-safe entropy statistic knobs ----
+        entropy_num_heads_sample: int = 4,
+        entropy_q_chunk_size: int = 8,
+        entropy_tokens_per_frame_sample: int = 16,
     ):
         super().__init__()
         self.collector = collector
@@ -235,6 +239,147 @@ class CogVideoXAttnProcessor2_0ForEntropy(CogVideoXAttnProcessor2_0):
         self.cond_only = bool(cond_only)
         self.enabled = True
         self.current_num_latent_frames: Optional[int] = None
+
+        # 控制显存和速度的节流参数
+        self.entropy_num_heads_sample = int(entropy_num_heads_sample)
+        self.entropy_q_chunk_size = int(entropy_q_chunk_size)
+        self.entropy_tokens_per_frame_sample = int(entropy_tokens_per_frame_sample)
+
+    def _compute_frame_entropy_chunked(
+        self,
+        q: torch.Tensor,              # [B,H,S,D]
+        k: torch.Tensor,              # [B,H,S,D]
+        attention_mask: Optional[torch.Tensor],  # [B,H,Q,K] or None
+        text_seq_length: int,
+        image_seq_length: int,
+        head_dim: int,
+    ) -> Optional[torch.Tensor]:
+        """
+        Memory-safe entropy computation on image queries only.
+        Returns frame entropy [T_latent] (cpu tensor) or None if cannot infer layout.
+        """
+        T_latent = self.current_num_latent_frames
+        if T_latent is None or T_latent <= 0:
+            return None
+        if image_seq_length % T_latent != 0:
+            return None
+
+        tokens_per_frame = image_seq_length // T_latent
+        if tokens_per_frame <= 0:
+            return None
+
+        # ---- optional CFG cond-only ----
+        q_stat = q
+        k_stat = k
+        am_stat = attention_mask
+        if self.cond_only and q_stat.shape[0] % 2 == 0:
+            half = q_stat.shape[0] // 2
+            q_stat = q_stat[half:]
+            k_stat = k_stat[half:]
+            if am_stat is not None and am_stat.shape[0] == q.shape[0]:
+                am_stat = am_stat[half:]
+
+        B, H, S, D = q_stat.shape
+        q0 = text_seq_length
+        q1 = text_seq_length + image_seq_length
+
+        # ---- sample heads (important for memory + speed) ----
+        if self.entropy_num_heads_sample > 0 and self.entropy_num_heads_sample < H:
+            head_idx = torch.linspace(
+                0, H - 1, steps=self.entropy_num_heads_sample, device=q_stat.device
+            ).round().long().unique()
+            q_stat = q_stat[:, head_idx, :, :]
+            k_stat = k_stat[:, head_idx, :, :]
+            if am_stat is not None and am_stat.shape[1] == H:
+                am_stat = am_stat[:, head_idx, :, :]
+            H_eff = q_stat.shape[1]
+        else:
+            H_eff = H
+
+        # image query slice only
+        q_img = q_stat[:, :, q0:q1, :]   # [B,H,Qimg,D]
+        K_all = k_stat.shape[2]
+
+        # ---- sample query tokens per frame (heuristic but effective) ----
+        q_img_reshaped = q_img.reshape(B, H_eff, T_latent, tokens_per_frame, D)  # [B,H,T,Sf,D]
+        sample_n = self.entropy_tokens_per_frame_sample
+        if sample_n > 0 and sample_n < tokens_per_frame:
+            # evenly spaced sample indices in each frame
+            q_token_idx = torch.linspace(
+                0, tokens_per_frame - 1,
+                steps=sample_n,
+                device=q_img.device
+            ).round().long().unique()
+            q_img_reshaped = q_img_reshaped[:, :, :, q_token_idx, :]
+            tokens_used_per_frame = q_img_reshaped.shape[3]
+        else:
+            tokens_used_per_frame = tokens_per_frame
+
+        # flatten sampled image queries back
+        q_img_flat = q_img_reshaped.reshape(B, H_eff, T_latent * tokens_used_per_frame, D)  # [B,H,Qs,D]
+
+        # key range for entropy context
+        if self.use_nonkey_context:
+            k_used = k_stat  # [B,H,K,D], all keys (text + image)
+            am_used = am_stat
+            # key_slice_mode = "all"
+        else:
+            k0 = text_seq_length
+            k1 = text_seq_length + image_seq_length
+            k_used = k_stat[:, :, k0:k1, :]  # image-only keys
+            if am_stat is not None:
+                # original attention mask is [B,H,Q,K]; for q_img queries, take q rows then key cols
+                am_used = am_stat[:, :, q0:q1, k0:k1]
+            else:
+                am_used = None
+
+        # Accumulate entropy per sampled query token, then map to frames
+        Qs = q_img_flat.shape[2]
+        ent_per_q = torch.empty((B, H_eff, Qs), device=q_img_flat.device, dtype=torch.float32)
+
+        q_chunk = max(1, self.entropy_q_chunk_size)
+        scale = (head_dim ** -0.5)
+
+        # For sampled-row mask mapping if mask exists
+        sampled_global_idx = None
+        if am_used is not None:
+            if tokens_used_per_frame == tokens_per_frame:
+                sampled_local = torch.arange(image_seq_length, device=q_img_flat.device, dtype=torch.long)
+            else:
+                per_frame = torch.arange(T_latent, device=q_img_flat.device, dtype=torch.long)[:, None] * tokens_per_frame
+                q_token_idx = torch.linspace(
+                    0, tokens_per_frame - 1,
+                    steps=tokens_used_per_frame,
+                    device=q_img_flat.device
+                ).round().long().unique()
+                sampled_local = (per_frame + q_token_idx[None, :]).reshape(-1)
+            sampled_global_idx = sampled_local
+
+        for start in range(0, Qs, q_chunk):
+            end = min(start + q_chunk, Qs)
+            q_chunk_t = q_img_flat[:, :, start:end, :]  # [B,H,qc,D]
+
+            # logits chunk: [B,H,qc,K]
+            logits = torch.matmul(q_chunk_t.float(), k_used.float().transpose(-1, -2)) * scale
+
+            if am_used is not None:
+                if sampled_global_idx is None:
+                    am_chunk = am_used[:, :, start:end, :]
+                else:
+                    rows = sampled_global_idx[start:end]
+                    am_chunk = am_used[:, :, rows, :]
+                logits = logits + am_chunk
+
+            probs = torch.softmax(logits, dim=-1)
+            ent_chunk = -(probs.clamp_min(1e-12) * probs.clamp_min(1e-12).log()).sum(dim=-1)  # [B,H,qc]
+            ent_per_q[:, :, start:end] = ent_chunk
+
+            del logits, probs, ent_chunk, q_chunk_t
+
+        # [B,H,Qs] -> [B,H,T,tokens_used] -> average => [T]
+        ent_per_q = ent_per_q.reshape(B, H_eff, T_latent, tokens_used_per_frame)
+        ent_frame = ent_per_q.mean(dim=(0, 1, 3))  # [T_latent]
+        return ent_frame.detach().cpu()
 
     def _calculate_attention_and_entropy(
         self,
@@ -281,44 +426,15 @@ class CogVideoXAttnProcessor2_0ForEntropy(CogVideoXAttnProcessor2_0):
         # ---- Entropy statistic (no-grad), only when enabled ----
         if self.enabled and self.collector is not None and self.collector.active:
             with torch.no_grad():
-                q_stat = q
-                k_stat = k
-                am_stat = attention_mask
-
-                # CFG batch split: keep cond branch only if requested
-                if self.cond_only and q_stat.shape[0] % 2 == 0:
-                    half = q_stat.shape[0] // 2
-                    q_stat = q_stat[half:]
-                    k_stat = k_stat[half:]
-                    if am_stat is not None and am_stat.shape[0] == q.shape[0]:
-                        am_stat = am_stat[half:]
-
-                logits = torch.matmul(q_stat.float(), k_stat.float().transpose(-1, -2)) * (head_dim ** -0.5)
-                if am_stat is not None:
-                    logits = logits + am_stat
-
-                probs = torch.softmax(logits, dim=-1)  # [B,H,Q,K]
-
-                # image query rows only
-                q0 = text_seq_length
-                q1 = text_seq_length + image_seq_length
-                p_imgq = probs[:, :, q0:q1, :]  # [B,H,Qimg,K]
-
-                if not self.use_nonkey_context:
-                    # restrict keys to image tokens only, renormalize
-                    k0 = text_seq_length
-                    k1 = text_seq_length + image_seq_length
-                    p_imgq = p_imgq[..., k0:k1]
-                    p_imgq = p_imgq / p_imgq.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-
-                ent_token = -(p_imgq.clamp_min(1e-12) * p_imgq.clamp_min(1e-12).log()).sum(dim=-1)
-                # ent_token: [B,H,Qimg]
-
-                T_latent = self.current_num_latent_frames
-                if T_latent is not None and T_latent > 0 and (image_seq_length % T_latent == 0):
-                    tokens_per_frame = image_seq_length // T_latent
-                    ent_token = ent_token.reshape(ent_token.shape[0], ent_token.shape[1], T_latent, tokens_per_frame)
-                    ent_frame = ent_token.mean(dim=(0, 1, 3))  # [T_latent]
+                ent_frame = self._compute_frame_entropy_chunked(
+                    q=q,
+                    k=k,
+                    attention_mask=attention_mask,
+                    text_seq_length=text_seq_length,
+                    image_seq_length=image_seq_length,
+                    head_dim=head_dim,
+                )
+                if ent_frame is not None:
                     self.collector.add_step_frame_entropy(ent_frame)
 
         # ---- Normal attention output (kept compatible) ----
@@ -652,7 +768,11 @@ def sample_cogvideo_t2v_with_entropy_keyframes(
         return CogVideoXAttnProcessor2_0ForEntropy(
             collector=collector,
             use_nonkey_context=bool(cfg.use_nonkey_context),
-            cond_only=False,  # start simple/stable: average cond+uncond statistics
+            # 先只统计 cond 分支 + 采样少量 heads / tokens，避免 OOM
+            cond_only=True,
+            entropy_num_heads_sample=4,
+            entropy_q_chunk_size=8,
+            entropy_tokens_per_frame_sample=16,
         )
 
     with OverrideCogVideoAttnProcessors(
