@@ -101,6 +101,46 @@ def main() -> None:
     p.add_argument("--wan_save_teacache_trace_png", action="store_true")
     p.add_argument("--wan_no_save_teacache_trace_png", action="store_true")
 
+    # -------- CogVideo (Diffusers) T2V 参数 --------
+    p.add_argument("--cogvideo_precision", type=str, default="bfloat16", choices=["bfloat16", "float16"])
+    p.add_argument("--cogvideo_height", type=int, default=480)
+    p.add_argument("--cogvideo_width", type=int, default=720)
+    p.add_argument("--cogvideo_num_frames", type=int, default=49)
+    p.add_argument("--cogvideo_num_inference_steps", type=int, default=50)
+    p.add_argument("--cogvideo_guidance_scale", type=float, default=6.0)
+    p.add_argument("--cogvideo_seed", type=int, default=0)
+    p.add_argument("--cogvideo_scheduler", type=str, default="ddim", choices=["ddim", "dpm"])
+    p.add_argument("--cogvideo_use_dynamic_cfg", action="store_true")
+    p.add_argument("--cogvideo_no_dynamic_cfg", action="store_true")
+
+    # CogVideo: entropy keyframe (true latent-time prune)
+    p.add_argument("--cogvideo_keyframe_by_entropy", action="store_true")
+    p.add_argument("--cogvideo_entropy_steps", type=int, default=5)
+    p.add_argument("--cogvideo_entropy_mode", type=str, default="mean", choices=["last", "mean", "ema"])
+    p.add_argument("--cogvideo_entropy_ema_alpha", type=float, default=0.6)
+    p.add_argument("--cogvideo_entropy_block_idx", type=int, default=-1)
+    p.add_argument("--cogvideo_keyframe_topk", type=int, default=8)
+    p.add_argument("--cogvideo_keyframe_cover", action="store_true")
+    p.add_argument("--cogvideo_no_keyframe_cover", action="store_true")
+    p.add_argument("--cogvideo_use_nonkey_context", action="store_true")
+    p.add_argument("--cogvideo_no_nonkey_context", action="store_true")
+    p.add_argument("--cogvideo_keyframe_out_fps", type=float, default=None)
+    p.add_argument("--cogvideo_keyframe_target_fps", type=float, default=8.0)
+
+    p.add_argument("--cogvideo_entropy_debug_dir", type=str, default=None)
+    p.add_argument("--cogvideo_save_debug_pt", action="store_true")
+    p.add_argument("--cogvideo_no_save_debug_pt", action="store_true")
+    p.add_argument("--cogvideo_profile_timing", action="store_true")
+    p.add_argument("--cogvideo_no_profile_timing", action="store_true")
+
+    # CogVideo offload / memory
+    p.add_argument("--cogvideo_enable_sequential_cpu_offload", action="store_true")
+    p.add_argument("--cogvideo_enable_model_cpu_offload", action="store_true")
+    p.add_argument("--cogvideo_vae_tiling", action="store_true")
+    p.add_argument("--cogvideo_no_vae_tiling", action="store_true")
+    p.add_argument("--cogvideo_vae_slicing", action="store_true")
+    p.add_argument("--cogvideo_no_vae_slicing", action="store_true")
+
     # -------- 插帧参数（你原来的 pipeline 参数）--------
     p.add_argument("--eden_config", type=str, required=True)
     p.add_argument("--output_path", type=str, default="interpolation_outputs/final.mp4")
@@ -204,81 +244,162 @@ def main() -> None:
         os.makedirs(os.path.dirname(args.cloud_metrics_csv) or ".", exist_ok=True)
     if args.wan_entropy_debug_dir:
         os.makedirs(args.wan_entropy_debug_dir, exist_ok=True)
+    if args.cogvideo_entropy_debug_dir:
+        os.makedirs(args.cogvideo_entropy_debug_dir, exist_ok=True)
 
     # 延迟导入（与 run_pipeline.py 一致）
-    from vdit.generators.wan_t2v import WanGenerateConfig
     from vdit.pipeline.full_pipeline import FullPipelineConfig, run_full_pipeline
     from vdit.pipeline.run_iframe import PipelineConfig
 
-    # WAN 配置（仅在需要 WAN 生成时使用）
-    keyframe_cover = True
-    if args.wan_no_keyframe_cover:
-        keyframe_cover = False
-    elif args.wan_keyframe_cover:
+    # ---- generator-specific cfg ----
+    if args.generator == "wan":
+        from vdit.generators.wan_t2v import WanGenerateConfig
+
         keyframe_cover = True
+        if args.wan_no_keyframe_cover:
+            keyframe_cover = False
+        elif args.wan_keyframe_cover:
+            keyframe_cover = True
 
-    use_nonkey_context = True
-    if args.wan_no_nonkey_context:
-        use_nonkey_context = False
-    elif args.wan_use_nonkey_context:
         use_nonkey_context = True
+        if args.wan_no_nonkey_context:
+            use_nonkey_context = False
+        elif args.wan_use_nonkey_context:
+            use_nonkey_context = True
 
-    save_debug_pt = True
-    if args.wan_no_save_debug_pt:
-        save_debug_pt = False
-    elif args.wan_save_debug_pt:
         save_debug_pt = True
+        if args.wan_no_save_debug_pt:
+            save_debug_pt = False
+        elif args.wan_save_debug_pt:
+            save_debug_pt = True
 
-    profile_timing = True
-    if args.wan_no_profile_timing:
-        profile_timing = False
-    elif args.wan_profile_timing:
         profile_timing = True
+        if args.wan_no_profile_timing:
+            profile_timing = False
+        elif args.wan_profile_timing:
+            profile_timing = True
 
-    save_teacache_trace_png = True
-    if args.wan_no_save_teacache_trace_png:
-        save_teacache_trace_png = False
-    elif args.wan_save_teacache_trace_png:
         save_teacache_trace_png = True
+        if args.wan_no_save_teacache_trace_png:
+            save_teacache_trace_png = False
+        elif args.wan_save_teacache_trace_png:
+            save_teacache_trace_png = True
 
-    wan_cfg = WanGenerateConfig(
-        wan_version=args.wan_version,
-        task=args.wan_task,
-        size=args.wan_size,
-        frame_num=args.wan_frame_num,
-        sample_solver=args.wan_sample_solver,
-        sample_steps=args.wan_sample_steps,
-        sample_shift=args.wan_sample_shift,
-        guide_scale=args.wan_guide_scale,
-        seed=args.wan_seed,
-        offload_model=(True if args.wan_offload_model else True),  # 默认 True
-        out_fps=args.wan_out_fps,
-        frame_sample=args.wan_frame_sample,
-        frame_sample_seed=args.wan_frame_sample_seed,
-        keyframe_by_entropy=args.wan_keyframe_by_entropy,
-        entropy_steps=args.wan_entropy_steps,
-        entropy_mode=args.wan_entropy_mode,
-        entropy_ema_alpha=args.wan_entropy_ema_alpha,
-        entropy_block_idx=args.wan_entropy_block_idx,
-        keyframe_topk=args.wan_keyframe_topk,
-        keyframe_cover=keyframe_cover,
-        keyframe_select_mode=args.wan_keyframe_select_mode,
-        keyframe_sample_seed=args.wan_keyframe_sample_seed,
-        use_nonkey_context=use_nonkey_context,
-        debug_dir=args.wan_entropy_debug_dir,
-        save_debug_pt=save_debug_pt,
-        profile_timing=profile_timing,
-        keyframe_out_fps=args.wan_keyframe_out_fps,
-        keyframe_target_fps=args.wan_keyframe_target_fps,
-        nonkey_update_mode=args.wan_nonkey_update_mode,
-        nonkey_update_interval=args.wan_nonkey_update_interval,
-        teacache_rel_l1_thresh=args.wan_teacache_rel_l1_thresh,
-        teacache_max_skip=args.wan_teacache_max_skip,
-        teacache_warmup=args.wan_teacache_warmup,
-        save_teacache_trace_png=save_teacache_trace_png,
-        device_id=0,
-        t5_cpu=False,
-    )
+        gen_cfg = WanGenerateConfig(
+            wan_version=args.wan_version,
+            task=args.wan_task,
+            size=args.wan_size,
+            frame_num=args.wan_frame_num,
+            sample_solver=args.wan_sample_solver,
+            sample_steps=args.wan_sample_steps,
+            sample_shift=args.wan_sample_shift,
+            guide_scale=args.wan_guide_scale,
+            seed=args.wan_seed,
+            offload_model=(True if args.wan_offload_model else True),
+            out_fps=args.wan_out_fps,
+            frame_sample=args.wan_frame_sample,
+            frame_sample_seed=args.wan_frame_sample_seed,
+            keyframe_by_entropy=args.wan_keyframe_by_entropy,
+            entropy_steps=args.wan_entropy_steps,
+            entropy_mode=args.wan_entropy_mode,
+            entropy_ema_alpha=args.wan_entropy_ema_alpha,
+            entropy_block_idx=args.wan_entropy_block_idx,
+            keyframe_topk=args.wan_keyframe_topk,
+            keyframe_cover=keyframe_cover,
+            keyframe_select_mode=args.wan_keyframe_select_mode,
+            keyframe_sample_seed=args.wan_keyframe_sample_seed,
+            use_nonkey_context=use_nonkey_context,
+            debug_dir=args.wan_entropy_debug_dir,
+            save_debug_pt=save_debug_pt,
+            profile_timing=profile_timing,
+            keyframe_out_fps=args.wan_keyframe_out_fps,
+            keyframe_target_fps=args.wan_keyframe_target_fps,
+            nonkey_update_mode=args.wan_nonkey_update_mode,
+            nonkey_update_interval=args.wan_nonkey_update_interval,
+            teacache_rel_l1_thresh=args.wan_teacache_rel_l1_thresh,
+            teacache_max_skip=args.wan_teacache_max_skip,
+            teacache_warmup=args.wan_teacache_warmup,
+            save_teacache_trace_png=save_teacache_trace_png,
+            device_id=0,
+            t5_cpu=False,
+        )
+
+    elif args.generator == "cogvideo":
+        from vdit.generators.cogvideo_t2v import CogVideoGenerateConfig
+
+        cog_keyframe_cover = True
+        if args.cogvideo_no_keyframe_cover:
+            cog_keyframe_cover = False
+        elif args.cogvideo_keyframe_cover:
+            cog_keyframe_cover = True
+
+        cog_use_nonkey_context = True
+        if args.cogvideo_no_nonkey_context:
+            cog_use_nonkey_context = False
+        elif args.cogvideo_use_nonkey_context:
+            cog_use_nonkey_context = True
+
+        cog_save_debug_pt = True
+        if args.cogvideo_no_save_debug_pt:
+            cog_save_debug_pt = False
+        elif args.cogvideo_save_debug_pt:
+            cog_save_debug_pt = True
+
+        cog_profile_timing = True
+        if args.cogvideo_no_profile_timing:
+            cog_profile_timing = False
+        elif args.cogvideo_profile_timing:
+            cog_profile_timing = True
+
+        cog_use_dynamic_cfg = True
+        if args.cogvideo_no_dynamic_cfg:
+            cog_use_dynamic_cfg = False
+        elif args.cogvideo_use_dynamic_cfg:
+            cog_use_dynamic_cfg = True
+
+        cog_vae_tiling = True
+        if args.cogvideo_no_vae_tiling:
+            cog_vae_tiling = False
+        elif args.cogvideo_vae_tiling:
+            cog_vae_tiling = True
+
+        cog_vae_slicing = True
+        if args.cogvideo_no_vae_slicing:
+            cog_vae_slicing = False
+        elif args.cogvideo_vae_slicing:
+            cog_vae_slicing = True
+
+        gen_cfg = CogVideoGenerateConfig(
+            precision=args.cogvideo_precision,
+            device="cuda",
+            seed=args.cogvideo_seed,
+            height=args.cogvideo_height,
+            width=args.cogvideo_width,
+            num_frames=args.cogvideo_num_frames,
+            num_inference_steps=args.cogvideo_num_inference_steps,
+            guidance_scale=args.cogvideo_guidance_scale,
+            use_dynamic_cfg=cog_use_dynamic_cfg,
+            scheduler=args.cogvideo_scheduler,
+            keyframe_by_entropy=args.cogvideo_keyframe_by_entropy,
+            entropy_steps=args.cogvideo_entropy_steps,
+            entropy_mode=args.cogvideo_entropy_mode,
+            entropy_ema_alpha=args.cogvideo_entropy_ema_alpha,
+            entropy_block_idx=args.cogvideo_entropy_block_idx,
+            keyframe_topk=args.cogvideo_keyframe_topk,
+            keyframe_cover=cog_keyframe_cover,
+            use_nonkey_context=cog_use_nonkey_context,
+            keyframe_out_fps=args.cogvideo_keyframe_out_fps,
+            keyframe_target_fps=args.cogvideo_keyframe_target_fps,
+            debug_dir=args.cogvideo_entropy_debug_dir,
+            save_debug_pt=cog_save_debug_pt,
+            profile_timing=cog_profile_timing,
+            enable_sequential_cpu_offload=args.cogvideo_enable_sequential_cpu_offload,
+            enable_model_cpu_offload=args.cogvideo_enable_model_cpu_offload,
+            vae_tiling=cog_vae_tiling,
+            vae_slicing=cog_vae_slicing,
+        )
+    else:
+        p.error(f"Unsupported --generator: {args.generator}")
 
     iframe_cfg = PipelineConfig(
         eden_config=args.eden_config,
@@ -294,7 +415,7 @@ def main() -> None:
     )
 
     full_cfg = FullPipelineConfig(
-        wan=wan_cfg,
+        wan=gen_cfg,  # 历史字段名，实际承载任意 generator cfg
         iframe=iframe_cfg,
         generator_name=args.generator,
         stop_after_wan=args.stop_after_wan,
@@ -315,7 +436,7 @@ def main() -> None:
         save_sampled_video_path=args.save_sampled_video,
         save_keyframes_video_path=args.save_keyframes_video,  # 仍保留：用于"单机插帧流程"时保存 preview
         save_wan_video_path=args.save_wan_video,
-        generate_wan_full_baseline=args.wan_generate_full_baseline,
+        generate_wan_full_baseline=(args.wan_generate_full_baseline if args.generator == "wan" else False),
         save_wan_full_baseline_video_path=args.save_wan_full_baseline_video,
         metrics_json_path=args.metrics_json,
     )

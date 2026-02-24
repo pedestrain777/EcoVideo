@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import csv
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any
@@ -14,7 +14,6 @@ import time
 import torch
 
 from vdit.generators.base import create_generator
-from vdit.generators.wan_t2v import WanGenerateConfig
 from vdit.pipeline.run_iframe import PipelineConfig, run_interpolation_pipeline_from_frames
 from vdit.pipeline.video_io import read_video_tensor, write_video_tensor
 
@@ -63,7 +62,8 @@ def _append_csv(path: Optional[str], row: Dict[str, Any], fieldnames: list) -> N
 
 @dataclass(frozen=True)
 class FullPipelineConfig:
-    wan: WanGenerateConfig
+    # wan: historical field name, holds any generator cfg (WAN/CogVideo/LTX)
+    wan: Any
     iframe: PipelineConfig
     generator_name: str = "wan"
 
@@ -105,7 +105,7 @@ def run_full_pipeline(
         "wan_ckpt_dir": wan_ckpt_dir,
         "prompt": prompt,
         "generator_name": cfg.generator_name,
-        "wan_cfg": cfg.wan.__dict__,
+        "wan_cfg": asdict(cfg.wan) if hasattr(cfg.wan, "__dataclass_fields__") else dict(vars(cfg.wan)),
         "iframe_cfg": {
             "eden_config": cfg.iframe.eden_config,
             "raft_ckpt": cfg.iframe.raft_ckpt,
@@ -152,9 +152,9 @@ def run_full_pipeline(
         _write_json(metrics_json_path, metrics)
         return metrics
 
-    # -------- baseline WAN full generation（可选）--------
+    # -------- baseline WAN full generation（可选，仅 WAN）--------
     baseline_wan_timing = None
-    if generate_wan_full_baseline:
+    if generate_wan_full_baseline and cfg.generator_name == "wan":
         if prompt is None or wan_ckpt_dir is None:
             raise ValueError("generate_wan_full_baseline=True requires prompt + wan_ckpt_dir")
 
@@ -162,6 +162,7 @@ def run_full_pipeline(
         if cfg.wan.debug_dir:
             baseline_debug_dir = os.path.join(str(cfg.wan.debug_dir), "baseline_full")
 
+        from vdit.generators.wan_t2v import WanGenerateConfig
         wan_baseline_cfg = replace(
             cfg.wan,
             keyframe_by_entropy=False,
@@ -229,18 +230,18 @@ def run_full_pipeline(
             "wan_ckpt_dir": wan_ckpt_dir,
             "generator_name": cfg.generator_name,
             "cfg": {
-                "wan_task": cfg.wan.task,
-                "wan_size": cfg.wan.size,
-                "wan_frame_num": cfg.wan.frame_num,
-                "wan_seed": cfg.wan.seed,
-                "keyframe_by_entropy": cfg.wan.keyframe_by_entropy,
-                "keyframe_topk": cfg.wan.keyframe_topk,
-                "keyframe_out_fps": cfg.wan.keyframe_out_fps,
-                "keyframe_target_fps": cfg.wan.keyframe_target_fps,
-                "nonkey_update_mode": cfg.wan.nonkey_update_mode,
-                "teacache_rel_l1_thresh": cfg.wan.teacache_rel_l1_thresh,
-                "teacache_max_skip": cfg.wan.teacache_max_skip,
-                "teacache_warmup": cfg.wan.teacache_warmup,
+                "wan_task": getattr(cfg.wan, "task", None),
+                "wan_size": getattr(cfg.wan, "size", None),
+                "wan_frame_num": getattr(cfg.wan, "frame_num", getattr(cfg.wan, "num_frames", None)),
+                "wan_seed": getattr(cfg.wan, "seed", None),
+                "keyframe_by_entropy": getattr(cfg.wan, "keyframe_by_entropy", None),
+                "keyframe_topk": getattr(cfg.wan, "keyframe_topk", None),
+                "keyframe_out_fps": getattr(cfg.wan, "keyframe_out_fps", None),
+                "keyframe_target_fps": getattr(cfg.wan, "keyframe_target_fps", None),
+                "nonkey_update_mode": getattr(cfg.wan, "nonkey_update_mode", None),
+                "teacache_rel_l1_thresh": getattr(cfg.wan, "teacache_rel_l1_thresh", None),
+                "teacache_max_skip": getattr(cfg.wan, "teacache_max_skip", None),
+                "teacache_warmup": getattr(cfg.wan, "teacache_warmup", None),
             },
             "timing": {
                 "cloud_latency_sec": float(metrics["timing"]["wan_main_wall_sec"]),
@@ -292,8 +293,8 @@ def run_full_pipeline(
         _write_json(metrics_json_path, metrics)
         return metrics
 
-    if cfg.wan.debug_dir:
-        wan_internal_timing = _read_json_if_exists(os.path.join(str(cfg.wan.debug_dir), "timing.json"))
+    if getattr(cfg.wan, "debug_dir", None):
+        wan_internal_timing = _read_json_if_exists(os.path.join(str(getattr(cfg.wan, "debug_dir")), "timing.json"))
         if wan_internal_timing is not None:
             metrics["wan_internal_timing"] = wan_internal_timing
 
