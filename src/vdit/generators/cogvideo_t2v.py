@@ -922,8 +922,9 @@ def generate_cogvideo_frames(
     device = torch.device(cfg.device)
     dtype = _torch_dtype_from_str(cfg.precision)
 
-    # CogVideo official demos commonly export 16 fps for t2v
-    fps_src = 16.0
+    # ---- FPS policy (IMPORTANT) ----
+    # CogVideoX: 49 frames at 8 fps ≈ 6s; previously 16 fps gave ~3s.
+    fps_src = 8.0
     fps_tgt = fps_src
 
     _ensure_dir(cfg.debug_dir)
@@ -1008,14 +1009,24 @@ def generate_cogvideo_frames(
     frames = _pipe_postprocess_video_to_vdit_frames(pipe, final_latents)
     t_decode = time.perf_counter() - t0_dec
 
-    # effective fps for keyframe video
-    if bool(cfg_eff.keyframe_by_entropy):
-        t_out = int(frames.shape[0])
-        t_full = int(cfg_eff.num_frames)
-        if t_full > 0:
-            fps_tgt = fps_src * (t_out / float(t_full))
-        if cfg_eff.keyframe_out_fps is not None:
-            fps_tgt = float(cfg_eff.keyframe_out_fps)
+    # ---- Decide output fps ----
+    # If user explicitly sets keyframe_out_fps, ALWAYS honor it (even without entropy).
+    if cfg_eff.keyframe_out_fps is not None:
+        fps_tgt = float(cfg_eff.keyframe_out_fps)
+    else:
+        # If using entropy prune and user sets keyframe_target_fps, use it as default fps
+        if bool(cfg_eff.keyframe_by_entropy) and (cfg_eff.keyframe_target_fps is not None):
+            fps_tgt = float(cfg_eff.keyframe_target_fps)
+        else:
+            fps_tgt = fps_src  # normal full video
+
+        # If entropy prune happens, keep duration consistent with the original video:
+        # duration_full = (F_full - 1)/fps_src, so fps_tgt = (F_out - 1)/duration_full
+        if bool(cfg_eff.keyframe_by_entropy):
+            F_full = int(cfg_eff.num_frames)
+            F_out = int(frames.shape[0])
+            if F_full >= 2 and F_out >= 2:
+                fps_tgt = (F_out - 1) * fps_src / float(F_full - 1)
 
     # ---- debug save ----
     if cfg_eff.debug_dir:
