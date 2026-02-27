@@ -157,7 +157,8 @@ def auto_keyframe_topk_cogvideo(
 def select_key_latent_frames(scores: torch.Tensor, topk: int, cover: bool = True) -> List[int]:
     """
     scores: [T_latent]
-    returns sorted unique indices
+    topk:   TOTAL budget of selected latent frames (including cover frames if enabled)
+    cover:  force include first and last latent frame within the budget
     """
     if scores.ndim != 1:
         raise ValueError(f"scores must be [T], got {tuple(scores.shape)}")
@@ -165,13 +166,27 @@ def select_key_latent_frames(scores: torch.Tensor, topk: int, cover: bool = True
     if T <= 0:
         raise ValueError("Empty scores")
 
-    k = max(1, min(int(topk), T))
-    idx = torch.topk(scores, k=k, largest=True).indices.tolist()
+    k_total = max(1, min(int(topk), T))
 
+    forced: List[int] = []
     if cover and T >= 2:
-        idx.extend([0, T - 1])
+        forced = [0, T - 1]
+    forced = sorted(set(forced))
 
-    idx = sorted(set(int(i) for i in idx))
+    # If budget is too small, just return forced (trim if needed)
+    if len(forced) >= k_total:
+        return forced[:k_total]
+
+    # Remaining slots after reserving forced frames
+    k_remain = k_total - len(forced)
+
+    # Mask forced indices so they won't be picked again
+    masked = scores.detach().clone()
+    for i in forced:
+        masked[i] = -float("inf")
+
+    picked = torch.topk(masked, k=k_remain, largest=True).indices.tolist()
+    idx = sorted(set(forced + [int(i) for i in picked]))
     return idx
 
 
