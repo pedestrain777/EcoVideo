@@ -1061,6 +1061,19 @@ def generate_cogvideo_frames(
                 {"scores": [float(x) for x in ent.detach().cpu().tolist()]},
             )
 
+        # compatibility: full_pipeline.py expects timing.json (like WAN)
+        _write_json(
+            os.path.join(cfg_eff.debug_dir, "timing.json"),
+            {
+                "pipeline_init_sec": float(t_init),
+                "prepare_latents_sec": float(t_prepare_latents),
+                "denoise_sec": float(t_denoise),
+                "decode_sec": float(t_decode),
+                "total_sec": float(t_init + t_prepare_latents + t_denoise + t_decode),
+                **{k: float(v) for k, v in (debug.get("timing", {}) or {}).items()},
+            },
+        )
+
     # free memory
     del final_latents, latents
     try:

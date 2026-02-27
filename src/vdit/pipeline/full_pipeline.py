@@ -311,7 +311,7 @@ def run_full_pipeline(
         output_path=output_path,
         cfg=cfg.iframe,
         log_file=log_file,
-        save_keyframes_video_path=save_keyframes_video_path,
+        save_keyframes_video_path=(None if cfg.save_keyframes_video_path else save_keyframes_video_path),
         return_timing=True,
     ) or {}
     metrics["timing"]["iframe_wall_sec"] = float(time.perf_counter() - t0)
