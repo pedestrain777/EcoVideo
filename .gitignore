@@ -21,6 +21,7 @@ logs/
 interpolation_outputs/
 debug/
 outputs/
+keyframes/
 *.log
 
 
